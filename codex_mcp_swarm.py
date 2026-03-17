@@ -38,7 +38,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -625,13 +625,7 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                **_CODEX_PROPERTIES,
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (default: no limit). Avoid setting this below 1800 for complex tasks.",
-                },
-            },
+            "properties": _CODEX_PROPERTIES,
             "required": ["prompt"],
         },
     },
@@ -664,10 +658,6 @@ TOOLS = [
                 "prompt": {
                     "type": "string",
                     "description": "The follow-up prompt to continue the conversation.",
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (default: no limit). Avoid setting this below 1800 for complex tasks.",
                 },
             },
             "required": ["prompt", "threadId"],
