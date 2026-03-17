@@ -38,7 +38,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -184,7 +184,11 @@ def _extract_result(stdout: str, stderr: str) -> str:
 
 
 def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
-    """Extract the final assistant message from JSONL output."""
+    """
+    Extract the final assistant message from JSONL output.
+    Handles both `codex exec --json` format (item.completed/agent_message)
+    and session file format (response_item/assistant).
+    """
     last_assistant_text = None
     for line in jsonl_text.splitlines():
         line = line.strip()
@@ -192,18 +196,29 @@ def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
             continue
         try:
             event = json.loads(line)
-            if event.get("type") != "response_item":
-                continue
-            payload = event.get("payload", {})
-            if payload.get("role") == "assistant" and payload.get("type") == "message":
-                content = payload.get("content") or []
-                texts = [
-                    c.get("text", "")
-                    for c in content
-                    if c.get("type") in ("output_text", "text", "input_text")
-                ]
-                if texts:
-                    last_assistant_text = "\n".join(texts)
+            etype = event.get("type", "")
+
+            # -- codex exec --json format
+            if etype == "item.completed":
+                item = event.get("item", {})
+                if item.get("type") == "agent_message":
+                    text = item.get("text", "")
+                    if text:
+                        last_assistant_text = text
+
+            # -- session file format (fallback)
+            elif etype == "response_item":
+                payload = event.get("payload", {})
+                if payload.get("role") == "assistant" and payload.get("type") == "message":
+                    content = payload.get("content") or []
+                    texts = [
+                        c.get("text", "")
+                        for c in content
+                        if c.get("type") in ("output_text", "text", "input_text")
+                    ]
+                    if texts:
+                        last_assistant_text = "\n".join(texts)
+
         except (json.JSONDecodeError, KeyError):
             continue
     return last_assistant_text
@@ -212,7 +227,7 @@ def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
 def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
     """
     Parse the JSONL stdout file to determine current Codex activity.
-    Returns a dict with: phase, last_tool, last_reasoning, progress.
+    Handles both `codex exec --json` format and session file format.
     """
     status: Dict[str, Any] = {
         "phase": "starting",
@@ -241,12 +256,41 @@ def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
             continue
 
         etype = event.get("type", "")
-        payload = event.get("payload", {})
 
-        if etype == "event_msg" and payload.get("type") == "task_started":
+        # ---- codex exec --json format ----
+
+        if etype == "turn.started":
             status["phase"] = "running"
 
+        elif etype in ("item.started", "item.completed"):
+            item = event.get("item", {})
+            itype = item.get("type", "")
+
+            if itype == "command_execution":
+                if etype == "item.started":
+                    status["tools_called"] += 1
+                    status["last_tool"] = "exec_command"
+                    status["last_tool_args"] = item.get("command", "")[:150]
+                # On completed, capture output
+                elif etype == "item.completed":
+                    output = item.get("aggregated_output", "")
+                    if output:
+                        status["last_reasoning"] = output[-200:]
+
+            elif itype == "agent_message" and etype == "item.completed":
+                text_val = item.get("text", "")
+                if text_val:
+                    status["last_assistant_text"] = text_val[-300:]
+
+        # ---- session file format (fallback) ----
+
+        elif etype == "event_msg":
+            payload = event.get("payload", {})
+            if payload.get("type") == "task_started":
+                status["phase"] = "running"
+
         elif etype == "response_item":
+            payload = event.get("payload", {})
             ptype = payload.get("type", "")
 
             if ptype == "function_call":
