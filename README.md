@@ -28,14 +28,14 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 ### Claude Code
 
 ```bash
-claude mcp add codex-swarm -- uvx codex-mcp-swarm \
+claude mcp add codex-swarm -- uvx --upgrade codex-mcp-swarm \
   -c model=gpt-5.4 \
   -c approval_policy=never \
   -c sandbox_mode=danger-full-access \
   --skip-git-repo-check
 ```
 
-That's it. No clone, no setup. `uvx` downloads and runs it directly from PyPI.
+That's it. No clone, no setup. `uvx` downloads and runs it directly from PyPI. The `--upgrade` flag ensures you always get the latest version on restart.
 
 > **Note:** Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`). Alternatively, use `pipx run codex-mcp-swarm` instead of `uvx codex-mcp-swarm`.
 
@@ -48,6 +48,7 @@ That's it. No clone, no setup. `uvx` downloads and runs it directly from PyPI.
       "type": "stdio",
       "command": "uvx",
       "args": [
+        "--upgrade",
         "codex-mcp-swarm",
         "-c", "model=gpt-5.4",
         "-c", "approval_policy=never",
