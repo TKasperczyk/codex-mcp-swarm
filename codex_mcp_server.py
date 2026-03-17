@@ -585,7 +585,7 @@ TOOLS = [
                 **_CODEX_PROPERTIES,
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: no limit).",
+                    "description": "Timeout in seconds (default: no limit). Avoid setting this below 1800 for complex tasks.",
                 },
             },
             "required": ["prompt"],
@@ -623,7 +623,7 @@ TOOLS = [
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: no limit).",
+                    "description": "Timeout in seconds (default: no limit). Avoid setting this below 1800 for complex tasks.",
                 },
             },
             "required": ["prompt", "threadId"],
