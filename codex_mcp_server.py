@@ -34,10 +34,11 @@ import logging
 import signal
 import traceback
 import argparse
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -64,8 +65,11 @@ TASK_DIR.mkdir(exist_ok=True, mode=0o700)
 SERVER_CONFIG: Dict[str, str] = {}
 SERVER_FLAGS: List[str] = []
 
+# Track async child PIDs so the SIGCHLD handler only reaps those
+_ASYNC_PIDS: Dict[int, int] = {}  # pid -> exit_status (set on reap)
+
 # ---------------------------------------------------------------------------
-# SIGCHLD handler -- reap zombies automatically
+# SIGCHLD handler -- reap only tracked async children
 # ---------------------------------------------------------------------------
 def _sigchld_handler(signum, frame):
     while True:
@@ -73,7 +77,10 @@ def _sigchld_handler(signum, frame):
             pid, status = os.waitpid(-1, os.WNOHANG)
             if pid == 0:
                 break
-            logging.debug("Reaped child PID %d (status %d)", pid, status)
+            if pid in _ASYNC_PIDS:
+                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                _ASYNC_PIDS[pid] = exit_code
+                logging.debug("Reaped async child PID %d (exit %d)", pid, exit_code)
         except ChildProcessError:
             break
         except Exception as exc:
@@ -98,7 +105,18 @@ def _safe_read(path: Path) -> str:
         return f"[Error reading {path}: {exc}]"
 
 
-def _is_alive(pid: Optional[int]) -> bool:
+def _get_pid_start_time(pid: int) -> Optional[float]:
+    """Get process start time from /proc (Linux). Returns None if unavailable."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # Field 22 (0-indexed: 21) is starttime in clock ticks
+        fields = stat.rsplit(")", 1)[-1].split()
+        return float(fields[19])  # index 19 after the closing paren
+    except Exception:
+        return None
+
+
+def _is_alive(pid: Optional[int], expected_start_time: Optional[float] = None) -> bool:
     if pid is None:
         return False
     try:
@@ -116,9 +134,17 @@ def _is_alive(pid: Optional[int]) -> bool:
         if stat_path.exists():
             for line in stat_path.read_text().splitlines():
                 if line.startswith("State:"):
-                    return "Z" not in line
+                    if "Z" in line:
+                        return False
     except Exception:
         pass
+
+    # Guard against PID reuse: if we recorded the start time, verify it matches
+    if expected_start_time is not None:
+        actual = _get_pid_start_time(pid)
+        if actual is not None and actual != expected_start_time:
+            return False
+
     return True
 
 
@@ -135,6 +161,14 @@ def _send(response: Dict[str, Any]) -> None:
             "error": {"code": -32603, "message": f"Serialization error: {exc}"},
         }
         print(json.dumps(err), flush=True)
+
+
+_TASK_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_task_id(task_id: str) -> bool:
+    """Reject task IDs that aren't our generated 8-char hex format."""
+    return bool(_TASK_ID_RE.match(task_id))
 
 
 def _extract_result(stdout: str, stderr: str) -> str:
@@ -259,7 +293,13 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     merged = dict(SERVER_CONFIG)
     per_call = params.get("config") or {}
     for k, v in per_call.items():
-        merged[str(k)] = str(v)
+        # Serialize to TOML-compatible values (not Python repr)
+        if isinstance(v, bool):
+            merged[str(k)] = "true" if v else "false"
+        elif isinstance(v, (list, dict)):
+            merged[str(k)] = json.dumps(v)
+        else:
+            merged[str(k)] = str(v)
 
     # Model
     model = params.get("model")
@@ -381,9 +421,13 @@ def _start_async(params: dict) -> str:
             start_new_session=True,
         )
 
+    # Track PID for SIGCHLD handler (store sentinel -1, replaced on reap)
+    _ASYNC_PIDS[proc.pid] = -1
+
     meta = {
         "task_id": task_id,
         "pid": proc.pid,
+        "pid_start_time": _get_pid_start_time(proc.pid),
         "status": "running",
         "command": " ".join(cmd),
         "started_at": time.time(),
@@ -395,6 +439,8 @@ def _start_async(params: dict) -> str:
 
 
 def _check_task(task_id: str) -> Dict[str, Any]:
+    if not _validate_task_id(task_id):
+        return {"status": "error", "error": f"Invalid task ID: {task_id}"}
     meta_file = TASK_DIR / f"{task_id}.meta"
     if not meta_file.exists():
         return {"status": "not_found", "error": f"Task {task_id} not found"}
@@ -405,8 +451,9 @@ def _check_task(task_id: str) -> Dict[str, Any]:
         return {"status": "error", "error": f"Bad metadata: {exc}"}
 
     pid = meta.get("pid")
+    pid_start_time = meta.get("pid_start_time")
 
-    if _is_alive(pid):
+    if _is_alive(pid, expected_start_time=pid_start_time):
         elapsed = int(time.time() - meta["started_at"])
         return {
             "status": "running",
@@ -746,6 +793,9 @@ def _handle(request: Dict[str, Any]) -> None:
 
             parts = []
             for tid in task_ids:
+                if not _validate_task_id(tid):
+                    parts.append(f"=== Task {tid} === INVALID ID")
+                    continue
                 meta_file = TASK_DIR / f"{tid}.meta"
                 if not meta_file.exists():
                     parts.append(f"=== Task {tid} === NOT FOUND")
@@ -903,13 +953,21 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
+            rid = None
             try:
                 request = json.loads(line)
-                logging.debug(
-                    "Request: method=%s id=%s",
-                    request.get("method"),
-                    request.get("id"),
-                )
+                if not isinstance(request, dict):
+                    _send({
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid request: expected JSON object",
+                        },
+                    })
+                    continue
+                rid = request.get("id")
+                logging.debug("Request: method=%s id=%s", request.get("method"), rid)
                 _handle(request)
             except json.JSONDecodeError as exc:
                 _send({
@@ -923,7 +981,7 @@ def main() -> None:
                 )
                 _send({
                     "jsonrpc": "2.0",
-                    "id": request.get("id") if "request" in dir() else None,
+                    "id": rid,
                     "error": {
                         "code": -32603,
                         "message": f"Internal error: {exc}",
