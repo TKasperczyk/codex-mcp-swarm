@@ -126,6 +126,7 @@ All parameters from the official Codex MCP tool are supported:
 - Python 3.8+
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated
 - No pip dependencies (stdlib only)
+- Works on Linux and macOS (Linux gets extra PID reuse protection and zombie detection via `/proc`)
 
 ## Credits
 
