@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-mcp-swarm"
+version = "1.1.0"
+description = "Parallel Codex MCP server with live task monitoring, batch wait, and full flag parity"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    {name = "TKasperczyk"},
+]
+keywords = ["mcp", "codex", "openai", "async", "parallel", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/TKasperczyk/codex-mcp-swarm"
+Repository = "https://github.com/TKasperczyk/codex-mcp-swarm"
+Issues = "https://github.com/TKasperczyk/codex-mcp-swarm/issues"
+
+[project.scripts]
+codex-mcp-swarm = "codex_mcp_swarm:main"
+
+[tool.setuptools]
+py-modules = ["codex_mcp_swarm"]
