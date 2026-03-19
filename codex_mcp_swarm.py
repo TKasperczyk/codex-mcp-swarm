@@ -35,10 +35,11 @@ import signal
 import traceback
 import argparse
 import re
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.2.1"
+__version__ = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -148,19 +149,37 @@ def _is_alive(pid: Optional[int], expected_start_time: Optional[float] = None) -
     return True
 
 
+_send_lock = threading.Lock()
+_cancelled_requests: Set[Any] = set()
+_cancelled_lock = threading.Lock()
+
+
+def _is_cancelled(rid: Any) -> bool:
+    with _cancelled_lock:
+        return rid in _cancelled_requests
+
+
 def _send(response: Dict[str, Any]) -> None:
-    try:
-        out = json.dumps(response, ensure_ascii=False)
-        print(out, flush=True)
-        logging.debug("Sent id=%s (%d bytes)", response.get("id"), len(out))
-    except (TypeError, ValueError) as exc:
-        logging.error("Serialization failed: %s", exc)
-        err = {
-            "jsonrpc": "2.0",
-            "id": response.get("id"),
-            "error": {"code": -32603, "message": f"Serialization error: {exc}"},
-        }
-        print(json.dumps(err), flush=True)
+    # Don't send responses for cancelled requests
+    rid = response.get("id")
+    if rid is not None and _is_cancelled(rid):
+        with _cancelled_lock:
+            _cancelled_requests.discard(rid)
+        logging.info("Suppressed response for cancelled request id=%s", rid)
+        return
+    with _send_lock:
+        try:
+            out = json.dumps(response, ensure_ascii=False)
+            print(out, flush=True)
+            logging.debug("Sent id=%s (%d bytes)", rid, len(out))
+        except (TypeError, ValueError) as exc:
+            logging.error("Serialization failed: %s", exc)
+            err = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "error": {"code": -32603, "message": f"Serialization error: {exc}"},
+            }
+            print(json.dumps(err), flush=True)
 
 
 _TASK_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -171,25 +190,26 @@ def _validate_task_id(task_id: str) -> bool:
     return bool(_TASK_ID_RE.match(task_id))
 
 
-def _extract_result(stdout: str, stderr: str) -> str:
-    """Extract result from codex output. Handles both plain text and JSONL."""
+def _extract_result(stdout: str, stderr: str) -> Tuple[str, Optional[str]]:
+    """Extract result and thread ID from codex output. Returns (text, thread_id)."""
     if stdout.strip().startswith("{"):
-        extracted = _extract_from_jsonl(stdout)
-        if extracted:
-            return extracted
+        text, thread_id = _extract_from_jsonl(stdout)
+        if text:
+            return text, thread_id
     result = stdout.strip()
     if not result and stderr:
         result = stderr.strip()
-    return result or "No output from Codex"
+    return result or "No output from Codex", None
 
 
-def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
+def _extract_from_jsonl(jsonl_text: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extract the final assistant message from JSONL output.
+    Extract the final assistant message and thread ID from JSONL output.
     Handles both `codex exec --json` format (item.completed/agent_message)
     and session file format (response_item/assistant).
     """
     last_assistant_text = None
+    thread_id = None
     for line in jsonl_text.splitlines():
         line = line.strip()
         if not line:
@@ -198,8 +218,16 @@ def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
             event = json.loads(line)
             etype = event.get("type", "")
 
+            # -- thread/session ID extraction
+            if etype == "thread.started":
+                thread_id = event.get("thread_id")
+            elif etype == "session_meta":
+                payload = event.get("payload", {})
+                if not thread_id:
+                    thread_id = payload.get("id")
+
             # -- codex exec --json format
-            if etype == "item.completed":
+            elif etype == "item.completed":
                 item = event.get("item", {})
                 if item.get("type") == "agent_message":
                     text = item.get("text", "")
@@ -221,7 +249,7 @@ def _extract_from_jsonl(jsonl_text: str) -> Optional[str]:
 
         except (json.JSONDecodeError, KeyError):
             continue
-    return last_assistant_text
+    return last_assistant_text, thread_id
 
 
 def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
@@ -421,8 +449,12 @@ def _build_reply_command(thread_id: str, prompt: str) -> List[str]:
 # Sync execution
 # ===================================================================
 
-def _run_sync(params: dict, timeout: Optional[int] = None) -> str:
+def _run_sync(params: dict, timeout: Optional[int] = None) -> Tuple[str, Optional[str]]:
+    """Run codex synchronously. Returns (result_text, thread_id)."""
     cmd, cwd = _build_command(params)
+    # Add --json for structured output (enables thread_id extraction)
+    if "--json" not in cmd:
+        cmd.insert(2, "--json")
     logging.info("Sync exec: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -435,9 +467,9 @@ def _run_sync(params: dict, timeout: Optional[int] = None) -> str:
         )
         return _extract_result(result.stdout, result.stderr)
     except subprocess.TimeoutExpired:
-        return "Error: Codex execution timed out"
+        return "Error: Codex execution timed out", None
     except Exception as exc:
-        return f"Error calling Codex: {exc}"
+        return f"Error calling Codex: {exc}", None
 
 # ===================================================================
 # Async execution
@@ -499,15 +531,22 @@ def _check_task(task_id: str) -> Dict[str, Any]:
 
     if _is_alive(pid, expected_start_time=pid_start_time):
         elapsed = int(time.time() - meta["started_at"])
-        return {
+        resp: Dict[str, Any] = {
             "status": "running",
             "task_id": task_id,
             "elapsed_seconds": elapsed,
         }
+        # Try to extract thread_id from partial stdout (it's the first line)
+        stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
+        if stdout:
+            _, tid = _extract_from_jsonl(stdout)
+            if tid:
+                resp["thread_id"] = tid
+        return resp
 
     stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
     stderr = _safe_read(TASK_DIR / f"{task_id}.stderr")
-    result = _extract_result(stdout, stderr)
+    result, thread_id = _extract_result(stdout, stderr)
 
     completed_at = max(
         (TASK_DIR / f"{task_id}.stdout").stat().st_mtime
@@ -518,25 +557,45 @@ def _check_task(task_id: str) -> Dict[str, Any]:
 
     meta["status"] = "completed"
     meta["completed_at"] = completed_at
+    if thread_id:
+        meta["thread_id"] = thread_id
     try:
         meta_file.write_text(json.dumps(meta, indent=2))
     except Exception:
         pass
 
-    return {
+    resp: Dict[str, Any] = {
         "status": "completed",
         "task_id": task_id,
         "result": result,
         "elapsed_seconds": int(completed_at - meta["started_at"]),
     }
+    if thread_id:
+        resp["thread_id"] = thread_id
+    return resp
 
 
-def _wait_tasks(task_ids: List[str], timeout: Optional[int] = None) -> Dict[str, Any]:
-    """Block until all tasks complete (or timeout)."""
+def _wait_tasks(
+    task_ids: List[str],
+    timeout: Optional[int] = None,
+    request_id: Any = None,
+) -> Dict[str, Any]:
+    """Block until all tasks complete, timeout, or request is cancelled."""
     deadline = time.time() + timeout if timeout else None
     results = {}
 
     while True:
+        # Check if the MCP client cancelled this request
+        if request_id is not None and _is_cancelled(request_id):
+            for tid in task_ids:
+                if tid not in results:
+                    results[tid] = {
+                        "status": "cancelled",
+                        "task_id": tid,
+                        "error": "Wait cancelled by client",
+                    }
+            break
+
         pending = []
         for tid in task_ids:
             if tid in results:
@@ -741,6 +800,14 @@ def _handle(request: Dict[str, Any]) -> None:
     if method == "notifications/initialized":
         return
 
+    if method == "notifications/cancelled":
+        cancelled_id = params.get("requestId")
+        if cancelled_id is not None:
+            logging.info("Client cancelled request id=%s", cancelled_id)
+            with _cancelled_lock:
+                _cancelled_requests.add(cancelled_id)
+        return
+
     if method == "tools/list":
         _send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
         return
@@ -751,11 +818,14 @@ def _handle(request: Dict[str, Any]) -> None:
 
         if tool == "codex":
             timeout = args.pop("timeout", None)
-            result = _run_sync(args, timeout=timeout)
+            result, thread_id = _run_sync(args, timeout=timeout)
+            text = result
+            if thread_id:
+                text += f"\n\n---\nThread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
             _send({
                 "jsonrpc": "2.0",
                 "id": rid,
-                "result": {"content": [{"type": "text", "text": result}]},
+                "result": {"content": [{"type": "text", "text": text}]},
             })
 
         elif tool == "codex_async":
@@ -803,7 +873,7 @@ def _handle(request: Dict[str, Any]) -> None:
                     text=True,
                     timeout=timeout,
                 )
-                text = _extract_result(result.stdout, result.stderr)
+                text, _ = _extract_result(result.stdout, result.stderr)
             except subprocess.TimeoutExpired:
                 text = "Error: Codex reply timed out"
             except Exception as exc:
@@ -843,11 +913,21 @@ def _handle(request: Dict[str, Any]) -> None:
 
                 alive = _is_alive(meta.get("pid"))
                 elapsed = int(time.time() - meta.get("started_at", time.time()))
-                jsonl_status = _parse_jsonl_status(TASK_DIR / f"{tid}.stdout")
+                stdout_path = TASK_DIR / f"{tid}.stdout"
+                jsonl_status = _parse_jsonl_status(stdout_path)
 
                 lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
                 if not alive:
                     lines[0] = f"=== Task {tid} (COMPLETED in {elapsed}s) ==="
+
+                # Surface thread_id from meta or stdout
+                tid_thread = meta.get("thread_id")
+                if not tid_thread:
+                    stdout_text = _safe_read(stdout_path)
+                    if stdout_text:
+                        _, tid_thread = _extract_from_jsonl(stdout_text)
+                if tid_thread:
+                    lines.append(f"Thread ID: {tid_thread}")
 
                 lines.append(f"Phase: {jsonl_status['phase']}")
                 lines.append(f"Tools called: {jsonl_status['tools_called']}")
@@ -890,17 +970,20 @@ def _handle(request: Dict[str, Any]) -> None:
                 })
                 return
 
-            results = _wait_tasks(task_ids, timeout=timeout)
+            results = _wait_tasks(task_ids, timeout=timeout, request_id=rid)
 
             parts = []
             for tid in task_ids:
                 info = results.get(tid, {"status": "unknown"})
                 if info["status"] == "completed":
-                    parts.append(
+                    header = (
                         f"=== Task {tid} (completed in "
-                        f"{info['elapsed_seconds']}s) ===\n"
-                        f"{info['result']}"
+                        f"{info['elapsed_seconds']}s) ==="
                     )
+                    thread_id = info.get("thread_id")
+                    if thread_id:
+                        header += f"\nThread ID: {thread_id}"
+                    parts.append(f"{header}\n{info['result']}")
                 elif info["status"] == "timeout":
                     parts.append(
                         f"=== Task {tid} === STILL RUNNING (wait timed out, "
@@ -976,6 +1059,29 @@ def _parse_args() -> None:
         SERVER_FLAGS.append("--ephemeral")
 
 
+# Methods that can block and must be dispatched to worker threads
+_BLOCKING_METHODS = {"tools/call"}
+
+
+def _handle_threaded(request: Dict[str, Any]) -> None:
+    """Wrapper for _handle that catches exceptions in worker threads."""
+    rid = request.get("id")
+    try:
+        _handle(request)
+    except Exception as exc:
+        logging.error(
+            "Handler error (thread): %s\n%s", exc, traceback.format_exc()
+        )
+        _send({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "error": {
+                "code": -32603,
+                "message": f"Internal error: {exc}",
+            },
+        })
+
+
 def main() -> None:
     _parse_args()
     logging.info(
@@ -987,7 +1093,6 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
-            rid = None
             try:
                 request = json.loads(line)
                 if not isinstance(request, dict):
@@ -1000,9 +1105,20 @@ def main() -> None:
                         },
                     })
                     continue
-                rid = request.get("id")
-                logging.debug("Request: method=%s id=%s", request.get("method"), rid)
-                _handle(request)
+                method = request.get("method", "")
+                logging.debug("Request: method=%s id=%s", method, request.get("id"))
+
+                if method in _BLOCKING_METHODS:
+                    # Dispatch potentially blocking calls to a daemon thread
+                    # so the main stdin loop stays responsive
+                    t = threading.Thread(
+                        target=_handle_threaded,
+                        args=(request,),
+                        daemon=True,
+                    )
+                    t.start()
+                else:
+                    _handle(request)
             except json.JSONDecodeError as exc:
                 _send({
                     "jsonrpc": "2.0",
@@ -1010,6 +1126,7 @@ def main() -> None:
                     "error": {"code": -32700, "message": f"Parse error: {exc}"},
                 })
             except Exception as exc:
+                rid = request.get("id") if isinstance(request, dict) else None
                 logging.error(
                     "Handler error: %s\n%s", exc, traceback.format_exc()
                 )
