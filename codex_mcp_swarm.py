@@ -60,6 +60,11 @@ logging.basicConfig(
 TASK_DIR = Path(os.environ.get("CODEX_SWARM_TASK_DIR", "/tmp/codex_swarm_tasks"))
 TASK_DIR.mkdir(exist_ok=True, mode=0o700)
 
+WORKTREE_BASE_DIR = Path(
+    os.environ.get("CODEX_SWARM_WORKTREE_DIR", "/tmp/codex-swarm-worktrees")
+)
+WORKTREE_BASE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
 # ---------------------------------------------------------------------------
 # Server-level config (populated in main from CLI args)
 # ---------------------------------------------------------------------------
@@ -125,6 +130,159 @@ def _safe_read(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         return f"[Error reading {path}: {exc}]"
+
+
+def _create_worktree(run_id: str, base_cwd: Optional[str]) -> Tuple[str, str, str]:
+    """Create an isolated worktree. Returns (worktree_root, target_cwd, branch_name)."""
+    branch_name = f"codex-swarm/{run_id}"
+    worktree_root = WORKTREE_BASE_DIR / run_id
+
+    if base_cwd:
+        base_path = Path(base_cwd)
+        effective_cwd = base_path if base_path.is_absolute() else Path.cwd() / base_path
+    else:
+        effective_cwd = Path.cwd()
+    effective_cwd = effective_cwd.resolve()
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(effective_cwd), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        repo_root = Path(proc.stdout.strip()).resolve()
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"Failed to find git repo for {effective_cwd}: {detail}") from exc
+
+    try:
+        rel_subdir = effective_cwd.relative_to(repo_root)
+    except ValueError:
+        rel_subdir = Path(".")
+
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "-b",
+                branch_name,
+                str(worktree_root),
+                "HEAD",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(
+            f"Failed to create git worktree {worktree_root}: {detail}"
+        ) from exc
+
+    target_cwd = (worktree_root / rel_subdir).resolve()
+    logging.info(
+        "Created worktree %s (branch %s) for run %s", worktree_root, branch_name, run_id
+    )
+    return str(worktree_root), str(target_cwd), branch_name
+
+
+def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
+    """Remove a worktree and its branch. Returns True if cleanup succeeded."""
+    worktree_input = Path(worktree_path)
+    if not worktree_input.exists():
+        logging.debug("Worktree path already removed: %s", worktree_input)
+        return True
+
+    worktree_root = worktree_input
+    repo_root: Optional[Path] = None
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree_input), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        worktree_root = Path(proc.stdout.strip()).resolve()
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        logging.debug("Unable to resolve worktree root for %s: %s", worktree_input, detail)
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree_input), "rev-parse", "--git-common-dir"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        common_dir = Path(proc.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = (worktree_input / common_dir).resolve()
+        if common_dir.name == ".git":
+            repo_root = common_dir.parent
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        logging.debug("Unable to resolve git common dir for %s: %s", worktree_input, detail)
+
+    if worktree_root.exists():
+        remove_cwd = repo_root or worktree_root
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(remove_cwd),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree_root),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            logging.info("Removed worktree %s", worktree_root)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            lowered = detail.lower()
+            if not any(
+                token in lowered
+                for token in (
+                    "not a git repository",
+                    "working tree not found",
+                    "is not a working tree",
+                    "does not exist",
+                    "no such file",
+                )
+            ):
+                logging.warning("Failed to remove worktree %s: %s", worktree_root, detail)
+                return False
+
+    if branch_name and repo_root:
+        try:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            logging.info("Deleted worktree branch %s", branch_name)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            logging.debug("Ignoring worktree branch delete failure for %s: %s", branch_name, detail)
+
+    return True
 
 
 def _get_pid_start_time(pid: int) -> Optional[float]:
@@ -537,14 +695,35 @@ def _run_sync(
     params: dict,
     timeout: Optional[int] = None,
     request_id: Any = None,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], Optional[Dict[str, str]]]:
     """Run codex synchronously with cancellation support."""
-    cmd, cwd = _build_command(params)
-    # Add --json for structured output (enables thread_id extraction)
-    if "--json" not in cmd:
-        cmd.insert(2, "--json")
-    logging.info("Sync exec: %s", " ".join(cmd))
+    started_at = time.time()
+    cmd_params = dict(params)
+    worktree_info: Optional[Dict[str, str]] = None
+    run_id: Optional[str] = None
+    cmd: List[str] = []
+    thread_id: Optional[str] = None
+    meta_status = "failed"
+
+    worktree_enabled = bool(cmd_params.pop("worktree", False))
+
     try:
+        if worktree_enabled:
+            _cleanup_old_tasks()
+            run_id = uuid.uuid4().hex[:8]
+            wt_root, wt_cwd, worktree_branch = _create_worktree(run_id, cmd_params.get("cwd"))
+            cmd_params["cwd"] = wt_cwd
+            worktree_info = {
+                "worktree_root": wt_root,
+                "worktree_path": wt_cwd,
+                "worktree_branch": worktree_branch,
+            }
+
+        cmd, cwd = _build_command(cmd_params)
+        # Add --json for structured output (enables thread_id extraction)
+        if "--json" not in cmd:
+            cmd.insert(2, "--json")
+        logging.info("Sync exec: %s", " ".join(cmd))
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -554,10 +733,36 @@ def _run_sync(
             cwd=cwd,
         )
         deadline = time.time() + timeout if timeout is not None else None
-        return _wait_proc(proc, deadline=deadline, request_id=request_id,
-                          timeout_msg="Error: Codex execution timed out")
+        result, thread_id = _wait_proc(
+            proc,
+            deadline=deadline,
+            request_id=request_id,
+            timeout_msg="Error: Codex execution timed out",
+        )
+        meta_status = "completed"
+        return result, thread_id, worktree_info
     except Exception as exc:
-        return f"Error calling Codex: {exc}", None
+        return f"Error calling Codex: {exc}", None, worktree_info
+    finally:
+        if worktree_info and run_id:
+            meta = {
+                "task_id": run_id,
+                "status": meta_status,
+                "started_at": started_at,
+                "completed_at": time.time(),
+                "worktree_root": worktree_info["worktree_root"],
+                "worktree_path": worktree_info["worktree_path"],
+                "worktree_branch": worktree_info["worktree_branch"],
+            }
+            if cmd:
+                meta["command"] = " ".join(cmd)
+            if thread_id:
+                meta["thread_id"] = thread_id
+            try:
+                with open(TASK_DIR / f"{run_id}.meta", "w") as f:
+                    json.dump(meta, f, indent=2)
+            except Exception as exc:
+                logging.warning("Failed to persist sync worktree metadata for %s: %s", run_id, exc)
 
 
 def _run_reply_sync(
@@ -626,6 +831,15 @@ def _cleanup_old_tasks() -> None:
             if now - completed_at < _TASK_MAX_AGE:
                 continue
 
+            # Clean up worktree if present -- use worktree_root (stable path)
+            wt_root = meta.get("worktree_root") or meta.get("worktree_path")
+            worktree_branch = meta.get("worktree_branch")
+            if wt_root:
+                if not _remove_worktree(wt_root, worktree_branch or ""):
+                    # Worktree removal failed -- keep metadata for retry next sweep
+                    logging.warning("Deferring cleanup of task %s (worktree removal failed)", task_id)
+                    continue
+
             # Delete task files.
             # In-memory tracking (_ASYNC_PIDS/_ASYNC_PROCS) is already cleaned
             # by _resolve_task_state() during finalization -- no need to touch it here.
@@ -641,29 +855,46 @@ def _cleanup_old_tasks() -> None:
             continue
 
 
-def _start_async(params: dict) -> str:
+def _start_async(params: dict) -> Dict[str, Optional[str]]:
     _cleanup_old_tasks()
 
     task_id = uuid.uuid4().hex[:8]
-    cmd, cwd = _build_command(params)
-    # Add --json for structured output (enables live status parsing)
-    if "--json" not in cmd:
-        cmd.insert(2, "--json")
-    logging.info("Async start [%s]: %s", task_id, " ".join(cmd))
+    cmd_params = dict(params)
+    worktree_enabled = bool(cmd_params.pop("worktree", False))
+    worktree_root: Optional[str] = None
+    worktree_path: Optional[str] = None
+    worktree_branch: Optional[str] = None
 
-    stdout_f = TASK_DIR / f"{task_id}.stdout"
-    stderr_f = TASK_DIR / f"{task_id}.stderr"
+    if worktree_enabled:
+        worktree_root, wt_cwd, worktree_branch = _create_worktree(task_id, cmd_params.get("cwd"))
+        worktree_path = wt_cwd
+        cmd_params["cwd"] = wt_cwd
 
-    with open(stdout_f, "w") as out, open(stderr_f, "w") as err:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=err,
-            text=True,
-            cwd=cwd,
-            start_new_session=True,
-        )
+    try:
+        cmd, cwd = _build_command(cmd_params)
+        # Add --json for structured output (enables live status parsing)
+        if "--json" not in cmd:
+            cmd.insert(2, "--json")
+        logging.info("Async start [%s]: %s", task_id, " ".join(cmd))
+
+        stdout_f = TASK_DIR / f"{task_id}.stdout"
+        stderr_f = TASK_DIR / f"{task_id}.stderr"
+
+        with open(stdout_f, "w") as out, open(stderr_f, "w") as err:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                text=True,
+                cwd=cwd,
+                start_new_session=True,
+            )
+    except Exception:
+        # Clean up worktree if task launch fails after creation
+        if worktree_root and worktree_branch:
+            _remove_worktree(worktree_root, worktree_branch)
+        raise
 
     # Track PID for SIGCHLD handler (sentinel replaced on reap)
     _ASYNC_PIDS[proc.pid] = _NOT_REAPED
@@ -678,10 +909,20 @@ def _start_async(params: dict) -> str:
         "command": " ".join(cmd),
         "started_at": time.time(),
     }
+    if worktree_root:
+        meta["worktree_root"] = worktree_root
+    if worktree_path:
+        meta["worktree_path"] = worktree_path
+    if worktree_branch:
+        meta["worktree_branch"] = worktree_branch
     with open(TASK_DIR / f"{task_id}.meta", "w") as f:
         json.dump(meta, f, indent=2)
 
-    return task_id
+    return {
+        "task_id": task_id,
+        "worktree_path": worktree_path,
+        "worktree_branch": worktree_branch,
+    }
 
 
 # ===================================================================
@@ -849,11 +1090,16 @@ def _check_task(task_id: str) -> Dict[str, Any]:
         return state
 
     if status == "running":
+        meta = state.get("meta", {})
         resp: Dict[str, Any] = {
             "status": "running",
             "task_id": task_id,
             "elapsed_seconds": state["elapsed_seconds"],
         }
+        if meta.get("worktree_path"):
+            resp["worktree_path"] = meta["worktree_path"]
+        if meta.get("worktree_branch"):
+            resp["worktree_branch"] = meta["worktree_branch"]
         # Try to extract thread_id from partial stdout (it's the first line)
         stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
         if stdout:
@@ -866,6 +1112,7 @@ def _check_task(task_id: str) -> Dict[str, Any]:
     stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
     stderr = _safe_read(TASK_DIR / f"{task_id}.stderr")
     result, thread_id = _extract_result(stdout, stderr)
+    meta = state.get("meta", {})
 
     resp = {
         "status": status,
@@ -873,6 +1120,10 @@ def _check_task(task_id: str) -> Dict[str, Any]:
         "result": result,
         "elapsed_seconds": state["elapsed_seconds"],
     }
+    if meta.get("worktree_path"):
+        resp["worktree_path"] = meta["worktree_path"]
+    if meta.get("worktree_branch"):
+        resp["worktree_branch"] = meta["worktree_branch"]
     if thread_id:
         resp["thread_id"] = thread_id
     if status == "failed":
@@ -896,11 +1147,17 @@ def _wait_tasks(
         if request_id is not None and _is_cancelled(request_id):
             for tid in task_ids:
                 if tid not in results:
+                    state = _resolve_task_state(tid)
+                    meta = state.get("meta", {}) if isinstance(state, dict) else {}
                     results[tid] = {
                         "status": "cancelled",
                         "task_id": tid,
                         "error": "Wait cancelled by client",
                     }
+                    if meta.get("worktree_path"):
+                        results[tid]["worktree_path"] = meta["worktree_path"]
+                    if meta.get("worktree_branch"):
+                        results[tid]["worktree_branch"] = meta["worktree_branch"]
             break
 
         pending = []
@@ -918,11 +1175,17 @@ def _wait_tasks(
 
         if deadline is not None and time.time() >= deadline:
             for tid in pending:
+                state = _resolve_task_state(tid)
+                meta = state.get("meta", {}) if isinstance(state, dict) else {}
                 results[tid] = {
                     "status": "timeout",
                     "task_id": tid,
                     "error": "Still running (wait timed out, task NOT killed)",
                 }
+                if meta.get("worktree_path"):
+                    results[tid]["worktree_path"] = meta["worktree_path"]
+                if meta.get("worktree_branch"):
+                    results[tid]["worktree_branch"] = meta["worktree_branch"]
             break
 
         sleep_time = 2.0
@@ -957,6 +1220,10 @@ _CODEX_PROPERTIES = {
             "Working directory for the session. "
             "If relative, resolved against the server's cwd."
         ),
+    },
+    "worktree": {
+        "type": "boolean",
+        "description": "Run the task inside an isolated git worktree and branch.",
     },
     "model": {
         "type": "string",
@@ -1128,10 +1395,24 @@ def _handle(request: Dict[str, Any]) -> None:
 
         if tool == "codex":
             timeout = args.pop("timeout", None)
-            result, thread_id = _run_sync(args, timeout=timeout, request_id=rid)
+            result, thread_id, worktree_info = _run_sync(
+                args,
+                timeout=timeout,
+                request_id=rid,
+            )
             text = result
+            details = []
             if thread_id:
-                text += f"\n\n---\nThread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
+                details.append(
+                    f"Thread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
+                )
+            if worktree_info:
+                details.append(
+                    f"Worktree Path: {worktree_info['worktree_path']}\n"
+                    f"Worktree Branch: {worktree_info['worktree_branch']}"
+                )
+            if details:
+                text += f"\n\n---\n" + "\n\n---\n".join(details)
             _send({
                 "jsonrpc": "2.0",
                 "id": rid,
@@ -1139,20 +1420,28 @@ def _handle(request: Dict[str, Any]) -> None:
             })
 
         elif tool == "codex_async":
-            task_id = _start_async(args)
+            launch_info = _start_async(args)
+            task_id = launch_info["task_id"]
+            lines = [
+                "Codex task started in background.",
+                f"Task ID: {task_id}",
+            ]
+            if launch_info.get("worktree_path"):
+                lines.append(f"Worktree Path: {launch_info['worktree_path']}")
+            if launch_info.get("worktree_branch"):
+                lines.append(f"Worktree Branch: {launch_info['worktree_branch']}")
+            lines.extend([
+                "",
+                f'Use codex_wait(task_ids=["{task_id}"]) to wait for the result, '
+                f'or codex_status(task_ids=["{task_id}"]) to check progress.',
+            ])
             _send({
                 "jsonrpc": "2.0",
                 "id": rid,
                 "result": {
                     "content": [{
                         "type": "text",
-                        "text": (
-                            f"Codex task started in background.\n"
-                            f"Task ID: {task_id}\n\n"
-                            f'Use codex_wait(task_ids=["{task_id}"]) to wait '
-                            f"for the result, or codex_status(task_ids="
-                            f'["{task_id}"]) to check progress.'
-                        ),
+                        "text": "\n".join(lines),
                     }],
                 },
             })
@@ -1222,6 +1511,10 @@ def _handle(request: Dict[str, Any]) -> None:
                         _, tid_thread = _extract_from_jsonl(stdout_text)
                 if tid_thread:
                     lines.append(f"Thread ID: {tid_thread}")
+                if meta.get("worktree_path"):
+                    lines.append(f"Worktree: {meta['worktree_path']}")
+                if meta.get("worktree_branch"):
+                    lines.append(f"Branch: {meta['worktree_branch']}")
 
                 lines.append(f"Phase: {jsonl_status['phase']}")
                 lines.append(f"Tools called: {jsonl_status['tools_called']}")
@@ -1277,6 +1570,10 @@ def _handle(request: Dict[str, Any]) -> None:
                     thread_id = info.get("thread_id")
                     if thread_id:
                         header += f"\nThread ID: {thread_id}"
+                    if info.get("worktree_path"):
+                        header += f"\nWorktree: {info['worktree_path']}"
+                    if info.get("worktree_branch"):
+                        header += f"\nBranch: {info['worktree_branch']}"
                     parts.append(f"{header}\n{info['result']}")
                 elif info["status"] == "failed":
                     exit_code = info.get("exit_code", "?")
@@ -1284,19 +1581,33 @@ def _handle(request: Dict[str, Any]) -> None:
                         f"=== Task {tid} (FAILED in "
                         f"{info['elapsed_seconds']}s, exit {exit_code}) ==="
                     )
+                    if info.get("worktree_path"):
+                        header += f"\nWorktree: {info['worktree_path']}"
+                    if info.get("worktree_branch"):
+                        header += f"\nBranch: {info['worktree_branch']}"
                     detail = info.get("stderr") or info.get("result", "No output")
                     parts.append(f"{header}\n{detail}")
                 elif info["status"] == "timeout":
-                    parts.append(
+                    header = (
                         f"=== Task {tid} === STILL RUNNING (wait timed out, "
                         f"task is NOT killed -- call codex_wait again to "
                         f"resume waiting)"
                     )
+                    if info.get("worktree_path"):
+                        header += f"\nWorktree: {info['worktree_path']}"
+                    if info.get("worktree_branch"):
+                        header += f"\nBranch: {info['worktree_branch']}"
+                    parts.append(header)
                 else:
-                    parts.append(
+                    header = (
                         f"=== Task {tid} === "
                         f"{info.get('error', info['status'])}"
                     )
+                    if info.get("worktree_path"):
+                        header += f"\nWorktree: {info['worktree_path']}"
+                    if info.get("worktree_branch"):
+                        header += f"\nBranch: {info['worktree_branch']}"
+                    parts.append(header)
 
             _send({
                 "jsonrpc": "2.0",
