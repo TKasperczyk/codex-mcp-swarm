@@ -39,7 +39,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -66,27 +66,48 @@ TASK_DIR.mkdir(exist_ok=True, mode=0o700)
 SERVER_CONFIG: Dict[str, str] = {}
 SERVER_FLAGS: List[str] = []
 
-# Track async child PIDs so the SIGCHLD handler only reaps those
-_ASYNC_PIDS: Dict[int, int] = {}  # pid -> exit_status (set on reap)
+# Track async child PIDs so the SIGCHLD handler only reaps those.
+# Values: _NOT_REAPED sentinel = not yet reaped; int = real exit code.
+# Exit codes: >= 0 for normal exit, negative (-signal) for signal death.
+_NOT_REAPED = object()
+_ASYNC_PIDS: Dict[int, Any] = {}  # pid -> _NOT_REAPED | int (exit code)
+_ASYNC_PROCS: Dict[int, subprocess.Popen] = {}  # pid -> Popen (kept alive for returncode)
+
+# Per-task finalization locks to prevent concurrent _resolve_task_state races
+_task_finalize_locks: Dict[str, threading.Lock] = {}
+_task_finalize_guard = threading.Lock()
+
+
+def _get_task_lock(task_id: str) -> threading.Lock:
+    with _task_finalize_guard:
+        if task_id not in _task_finalize_locks:
+            _task_finalize_locks[task_id] = threading.Lock()
+        return _task_finalize_locks[task_id]
+
 
 # ---------------------------------------------------------------------------
 # SIGCHLD handler -- reap only tracked async children
 # ---------------------------------------------------------------------------
 def _sigchld_handler(signum, frame):
-    while True:
+    for pid in list(_ASYNC_PIDS):
+        if _ASYNC_PIDS.get(pid) is not _NOT_REAPED:
+            continue  # already reaped or removed by another thread
         try:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
-            if pid in _ASYNC_PIDS:
-                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+            rpid, status = os.waitpid(pid, os.WNOHANG)
+            if rpid == pid:
+                if os.WIFEXITED(status):
+                    exit_code = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    exit_code = -os.WTERMSIG(status)  # negative = killed by signal
+                else:
+                    exit_code = 127  # unknown abnormal termination
                 _ASYNC_PIDS[pid] = exit_code
                 logging.debug("Reaped async child PID %d (exit %d)", pid, exit_code)
         except ChildProcessError:
-            break
+            # Already reaped by subprocess internals -- exit code lost
+            _ASYNC_PIDS[pid] = None
         except Exception as exc:
-            logging.warning("SIGCHLD handler error: %s", exc)
-            break
+            logging.warning("SIGCHLD handler error for PID %d: %s", pid, exc)
 
 
 signal.signal(signal.SIGCHLD, _sigchld_handler)
@@ -351,6 +372,35 @@ def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
 
     return status
 
+
+def _flatten_config(prefix: str, value: Any, out: Dict[str, str]) -> None:
+    """Flatten nested config values into TOML-compatible dotted key/value pairs."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _flatten_config(f"{prefix}.{k}" if prefix else str(k), v, out)
+    elif isinstance(value, bool):
+        out[prefix] = "true" if value else "false"
+    elif isinstance(value, list):
+        # TOML array syntax with proper string escaping.
+        # Nested dicts/lists in arrays are not supported by -c key=value;
+        # skip them with a warning.
+        parts = []
+        for item in value:
+            if isinstance(item, (dict, list)):
+                logging.warning("Skipping unsupported nested %s in config list %s",
+                                type(item).__name__, prefix)
+                continue
+            if isinstance(item, str):
+                escaped = item.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                parts.append(f'"{escaped}"')
+            elif isinstance(item, bool):
+                parts.append("true" if item else "false")
+            else:
+                parts.append(str(item))
+        out[prefix] = f"[{', '.join(parts)}]"
+    else:
+        out[prefix] = str(value)
+
 # ===================================================================
 # Command builder
 # ===================================================================
@@ -365,13 +415,7 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     merged = dict(SERVER_CONFIG)
     per_call = params.get("config") or {}
     for k, v in per_call.items():
-        # Serialize to TOML-compatible values (not Python repr)
-        if isinstance(v, bool):
-            merged[str(k)] = "true" if v else "false"
-        elif isinstance(v, (list, dict)):
-            merged[str(k)] = json.dumps(v)
-        else:
-            merged[str(k)] = str(v)
+        _flatten_config(str(k), v, merged)
 
     # Model
     model = params.get("model")
@@ -446,36 +490,160 @@ def _build_reply_command(thread_id: str, prompt: str) -> List[str]:
     return cmd
 
 # ===================================================================
-# Sync execution
+# Sync execution (cancellable via Popen + poll)
 # ===================================================================
 
-def _run_sync(params: dict, timeout: Optional[int] = None) -> Tuple[str, Optional[str]]:
-    """Run codex synchronously. Returns (result_text, thread_id)."""
+_POLL_INTERVAL = 2  # seconds between cancellation/timeout checks
+
+
+def _wait_proc(
+    proc: subprocess.Popen,
+    deadline: Optional[float] = None,
+    request_id: Any = None,
+    timeout_msg: str = "Error: Codex execution timed out",
+) -> Tuple[str, Optional[str]]:
+    """
+    Wait for a Popen process with cancellation and timeout support.
+    Shared by sync codex and reply paths.
+    """
+    while True:
+        remaining = None
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return timeout_msg, None
+        wait_time = min(_POLL_INTERVAL, remaining) if remaining is not None else _POLL_INTERVAL
+        try:
+            stdout, stderr = proc.communicate(timeout=wait_time)
+            return _extract_result(stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if request_id is not None and _is_cancelled(request_id):
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return "Cancelled by client", None
+
+
+def _run_sync(
+    params: dict,
+    timeout: Optional[int] = None,
+    request_id: Any = None,
+) -> Tuple[str, Optional[str]]:
+    """Run codex synchronously with cancellation support."""
     cmd, cwd = _build_command(params)
     # Add --json for structured output (enables thread_id extraction)
     if "--json" not in cmd:
         cmd.insert(2, "--json")
     logging.info("Sync exec: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             cwd=cwd,
         )
-        return _extract_result(result.stdout, result.stderr)
-    except subprocess.TimeoutExpired:
-        return "Error: Codex execution timed out", None
+        deadline = time.time() + timeout if timeout is not None else None
+        return _wait_proc(proc, deadline=deadline, request_id=request_id,
+                          timeout_msg="Error: Codex execution timed out")
     except Exception as exc:
         return f"Error calling Codex: {exc}", None
+
+
+def _run_reply_sync(
+    thread_id: str,
+    prompt: str,
+    timeout: Optional[int] = None,
+    request_id: Any = None,
+) -> Tuple[str, Optional[str]]:
+    """Run codex reply synchronously with cancellation support."""
+    cmd = _build_reply_command(thread_id, prompt)
+    logging.info("Reply exec: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.time() + timeout if timeout is not None else None
+        return _wait_proc(proc, deadline=deadline, request_id=request_id,
+                          timeout_msg="Error: Codex reply timed out")
+    except Exception as exc:
+        return f"Error calling Codex reply: {exc}", None
 
 # ===================================================================
 # Async execution
 # ===================================================================
 
+try:
+    _TASK_MAX_AGE = int(os.environ.get("CODEX_SWARM_TASK_MAX_AGE", 86400))
+except (ValueError, TypeError):
+    _TASK_MAX_AGE = 86400  # default 24h
+_last_cleanup = 0.0
+
+
+def _cleanup_old_tasks() -> None:
+    """Remove task artifacts older than _TASK_MAX_AGE seconds."""
+    global _last_cleanup
+    now = time.time()
+    if now - _last_cleanup < 300:  # Run at most every 5 minutes
+        return
+    _last_cleanup = now
+
+    for meta_file in TASK_DIR.glob("*.meta"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            task_id = meta_file.stem
+            status = meta.get("status")
+
+            # Finalize unpolled "running" tasks whose process has died
+            if status == "running":
+                pid = meta.get("pid")
+                pid_start_time = meta.get("pid_start_time")
+                if _is_alive(pid, expected_start_time=pid_start_time):
+                    continue  # still running, skip
+                # Dead but never finalized -- resolve it now
+                _resolve_task_state(task_id)
+                # Re-read metadata after finalization
+                meta = json.loads(meta_file.read_text())
+                status = meta.get("status")
+
+            if status not in ("completed", "failed"):
+                continue
+            completed_at = meta.get("completed_at", 0)
+            if now - completed_at < _TASK_MAX_AGE:
+                continue
+
+            # Delete task files.
+            # In-memory tracking (_ASYNC_PIDS/_ASYNC_PROCS) is already cleaned
+            # by _resolve_task_state() during finalization -- no need to touch it here.
+            for ext in (".meta", ".stdout", ".stderr"):
+                (TASK_DIR / f"{task_id}{ext}").unlink(missing_ok=True)
+
+            # Prune per-task finalization lock
+            with _task_finalize_guard:
+                _task_finalize_locks.pop(task_id, None)
+
+            logging.debug("Cleaned up old task %s", task_id)
+        except Exception:
+            continue
+
+
 def _start_async(params: dict) -> str:
+    _cleanup_old_tasks()
+
     task_id = uuid.uuid4().hex[:8]
     cmd, cwd = _build_command(params)
     # Add --json for structured output (enables live status parsing)
@@ -497,8 +665,10 @@ def _start_async(params: dict) -> str:
             start_new_session=True,
         )
 
-    # Track PID for SIGCHLD handler (store sentinel -1, replaced on reap)
-    _ASYNC_PIDS[proc.pid] = -1
+    # Track PID for SIGCHLD handler (sentinel replaced on reap)
+    _ASYNC_PIDS[proc.pid] = _NOT_REAPED
+    # Keep Popen alive so Python's finalizer doesn't steal the exit code
+    _ASYNC_PROCS[proc.pid] = proc
 
     meta = {
         "task_id": task_id,
@@ -514,27 +684,175 @@ def _start_async(params: dict) -> str:
     return task_id
 
 
-def _check_task(task_id: str) -> Dict[str, Any]:
+# ===================================================================
+# Centralized task state resolution
+# ===================================================================
+
+def _resolve_task_state(task_id: str) -> Dict[str, Any]:
+    """
+    Single source of truth for task lifecycle state.
+
+    Returns dict with:
+      - status: "running" | "completed" | "failed" | "not_found" | "error"
+      - task_id
+      - meta (if status is running/completed/failed)
+      - elapsed_seconds (if status is running/completed/failed)
+      - exit_code (if failed, may be None)
+      - error (if error/not_found)
+
+    On first detection of process death, persists final state to metadata
+    and cleans up _ASYNC_PIDS.
+    """
     if not _validate_task_id(task_id):
-        return {"status": "error", "error": f"Invalid task ID: {task_id}"}
+        return {"status": "error", "task_id": task_id, "error": f"Invalid task ID: {task_id}"}
+
     meta_file = TASK_DIR / f"{task_id}.meta"
     if not meta_file.exists():
-        return {"status": "not_found", "error": f"Task {task_id} not found"}
+        return {"status": "not_found", "task_id": task_id, "error": f"Task {task_id} not found"}
 
     try:
         meta = json.loads(meta_file.read_text())
     except Exception as exc:
-        return {"status": "error", "error": f"Bad metadata: {exc}"}
+        return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
+
+    started_at = meta.get("started_at", time.time())
+
+    # Already finalized in a previous call
+    if meta.get("status") in ("completed", "failed"):
+        completed_at = meta.get("completed_at", started_at)
+        return {
+            "status": meta["status"],
+            "task_id": task_id,
+            "meta": meta,
+            "elapsed_seconds": int(completed_at - started_at),
+            "exit_code": meta.get("exit_code"),
+        }
 
     pid = meta.get("pid")
     pid_start_time = meta.get("pid_start_time")
 
     if _is_alive(pid, expected_start_time=pid_start_time):
-        elapsed = int(time.time() - meta["started_at"])
+        return {
+            "status": "running",
+            "task_id": task_id,
+            "meta": meta,
+            "elapsed_seconds": int(time.time() - started_at),
+        }
+
+    # --- Process is dead: finalize under lock ---
+    # Lock prevents concurrent threads from both finalizing the same task,
+    # which could cause one to lose the exit code after the other pops it.
+    lock = _get_task_lock(task_id)
+    with lock:
+        # Re-read metadata -- another thread may have finalized while we waited
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception as exc:
+            return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
+        if meta.get("status") in ("completed", "failed"):
+            completed_at = meta.get("completed_at", started_at)
+            return {
+                "status": meta["status"],
+                "task_id": task_id,
+                "meta": meta,
+                "elapsed_seconds": int(completed_at - started_at),
+                "exit_code": meta.get("exit_code"),
+            }
+
+        # Determine exit code.
+        # Priority: SIGCHLD handler (reaped with real status) > Popen.poll() > manual waitpid.
+        # IMPORTANT: Do NOT call proc.poll() if SIGCHLD already reaped -- Python's
+        # waitpid gets ECHILD and silently sets returncode=0, masking real failures.
+        exit_code = None
+        sigchld_code = _ASYNC_PIDS.get(pid, _NOT_REAPED)
+        if sigchld_code is not _NOT_REAPED and sigchld_code is not None:
+            # SIGCHLD handler got the real exit code (int, possibly negative for signals)
+            exit_code = sigchld_code
+        elif sigchld_code is _NOT_REAPED:
+            # Handler hasn't reaped yet; Popen.poll() should be safe here
+            proc = _ASYNC_PROCS.get(pid)
+            if proc is not None:
+                proc.poll()
+                # Re-check: SIGCHLD handler may have raced between our initial
+                # read and proc.poll(), reaping the child first. If so, poll()
+                # got ECHILD and set returncode=0 (bogus). Prefer the handler's
+                # real exit code.
+                raced_code = _ASYNC_PIDS.get(pid, _NOT_REAPED)
+                if raced_code is not _NOT_REAPED and raced_code is not None:
+                    exit_code = raced_code
+                elif proc.returncode is not None:
+                    exit_code = proc.returncode
+            if exit_code is None:
+                # Last resort: manual waitpid
+                try:
+                    rpid, wstatus = os.waitpid(pid, os.WNOHANG)
+                    if rpid == pid:
+                        if os.WIFEXITED(wstatus):
+                            exit_code = os.WEXITSTATUS(wstatus)
+                        elif os.WIFSIGNALED(wstatus):
+                            exit_code = -os.WTERMSIG(wstatus)
+                        else:
+                            exit_code = 127
+                except ChildProcessError:
+                    pass  # already reaped, exit_code stays None
+                except Exception:
+                    pass
+        # else: sigchld_code is None -- ChildProcessError in handler, exit code lost
+
+        # Use current time as completion timestamp. File mtimes are unreliable --
+        # a task that writes output early then runs silently would get a stale
+        # timestamp, causing premature cleanup.
+        completed_at = time.time()
+
+        # exit_code None means we lost it (race) -- check stderr for error clues
+        if exit_code is None:
+            stderr_text = _safe_read(TASK_DIR / f"{task_id}.stderr").strip()
+            if stderr_text:
+                # Non-empty stderr with unknown exit code -- assume failure
+                final_status = "failed"
+            else:
+                final_status = "completed"
+        elif exit_code != 0:
+            final_status = "failed"
+        else:
+            final_status = "completed"
+
+        # Persist final state to metadata
+        meta["status"] = final_status
+        meta["completed_at"] = completed_at
+        if exit_code is not None:
+            meta["exit_code"] = exit_code
+        try:
+            meta_file.write_text(json.dumps(meta, indent=2))
+        except Exception:
+            pass
+
+        # Cleanup in-memory tracking
+        _ASYNC_PIDS.pop(pid, None)
+        _ASYNC_PROCS.pop(pid, None)
+
+    return {
+        "status": final_status,
+        "task_id": task_id,
+        "meta": meta,
+        "elapsed_seconds": int(completed_at - started_at),
+        "exit_code": exit_code,
+    }
+
+
+def _check_task(task_id: str) -> Dict[str, Any]:
+    """Check task status and return formatted result dict."""
+    state = _resolve_task_state(task_id)
+    status = state["status"]
+
+    if status in ("error", "not_found"):
+        return state
+
+    if status == "running":
         resp: Dict[str, Any] = {
             "status": "running",
             "task_id": task_id,
-            "elapsed_seconds": elapsed,
+            "elapsed_seconds": state["elapsed_seconds"],
         }
         # Try to extract thread_id from partial stdout (it's the first line)
         stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
@@ -544,34 +862,23 @@ def _check_task(task_id: str) -> Dict[str, Any]:
                 resp["thread_id"] = tid
         return resp
 
+    # completed or failed
     stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
     stderr = _safe_read(TASK_DIR / f"{task_id}.stderr")
     result, thread_id = _extract_result(stdout, stderr)
 
-    completed_at = max(
-        (TASK_DIR / f"{task_id}.stdout").stat().st_mtime
-        if (TASK_DIR / f"{task_id}.stdout").exists() else 0,
-        (TASK_DIR / f"{task_id}.stderr").stat().st_mtime
-        if (TASK_DIR / f"{task_id}.stderr").exists() else 0,
-    ) or time.time()
-
-    meta["status"] = "completed"
-    meta["completed_at"] = completed_at
-    if thread_id:
-        meta["thread_id"] = thread_id
-    try:
-        meta_file.write_text(json.dumps(meta, indent=2))
-    except Exception:
-        pass
-
-    resp: Dict[str, Any] = {
-        "status": "completed",
+    resp = {
+        "status": status,
         "task_id": task_id,
         "result": result,
-        "elapsed_seconds": int(completed_at - meta["started_at"]),
+        "elapsed_seconds": state["elapsed_seconds"],
     }
     if thread_id:
         resp["thread_id"] = thread_id
+    if status == "failed":
+        resp["exit_code"] = state.get("exit_code")
+        if stderr and stderr.strip():
+            resp["stderr"] = stderr.strip()[-500:]
     return resp
 
 
@@ -581,7 +888,7 @@ def _wait_tasks(
     request_id: Any = None,
 ) -> Dict[str, Any]:
     """Block until all tasks complete, timeout, or request is cancelled."""
-    deadline = time.time() + timeout if timeout else None
+    deadline = time.time() + timeout if timeout is not None else None
     results = {}
 
     while True:
@@ -601,7 +908,7 @@ def _wait_tasks(
             if tid in results:
                 continue
             info = _check_task(tid)
-            if info["status"] in ("completed", "not_found", "error"):
+            if info["status"] in ("completed", "failed", "not_found", "error"):
                 results[tid] = info
             else:
                 pending.append(tid)
@@ -609,7 +916,7 @@ def _wait_tasks(
         if not pending:
             break
 
-        if deadline and time.time() >= deadline:
+        if deadline is not None and time.time() >= deadline:
             for tid in pending:
                 results[tid] = {
                     "status": "timeout",
@@ -618,7 +925,10 @@ def _wait_tasks(
                 }
             break
 
-        time.sleep(2)
+        sleep_time = 2.0
+        if deadline is not None:
+            sleep_time = min(sleep_time, max(0.1, deadline - time.time()))
+        time.sleep(sleep_time)
 
     return results
 
@@ -818,7 +1128,7 @@ def _handle(request: Dict[str, Any]) -> None:
 
         if tool == "codex":
             timeout = args.pop("timeout", None)
-            result, thread_id = _run_sync(args, timeout=timeout)
+            result, thread_id = _run_sync(args, timeout=timeout, request_id=rid)
             text = result
             if thread_id:
                 text += f"\n\n---\nThread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
@@ -863,22 +1173,9 @@ def _handle(request: Dict[str, Any]) -> None:
                 })
                 return
 
-            cmd = _build_reply_command(thread_id, prompt)
-            logging.info("Reply exec: %s", " ".join(cmd))
-            try:
-                result = subprocess.run(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
-                text, _ = _extract_result(result.stdout, result.stderr)
-            except subprocess.TimeoutExpired:
-                text = "Error: Codex reply timed out"
-            except Exception as exc:
-                text = f"Error calling Codex reply: {exc}"
-
+            text, _ = _run_reply_sync(
+                thread_id, prompt, timeout=timeout, request_id=rid
+            )
             _send({
                 "jsonrpc": "2.0",
                 "id": rid,
@@ -897,30 +1194,27 @@ def _handle(request: Dict[str, Any]) -> None:
 
             parts = []
             for tid in task_ids:
-                if not _validate_task_id(tid):
-                    parts.append(f"=== Task {tid} === INVALID ID")
-                    continue
-                meta_file = TASK_DIR / f"{tid}.meta"
-                if not meta_file.exists():
-                    parts.append(f"=== Task {tid} === NOT FOUND")
+                state = _resolve_task_state(tid)
+                status = state["status"]
+
+                if status in ("error", "not_found"):
+                    parts.append(f"=== Task {tid} === {state.get('error', status).upper()}")
                     continue
 
-                try:
-                    meta = json.loads(meta_file.read_text())
-                except Exception:
-                    parts.append(f"=== Task {tid} === ERROR reading metadata")
-                    continue
-
-                alive = _is_alive(meta.get("pid"))
-                elapsed = int(time.time() - meta.get("started_at", time.time()))
+                elapsed = state["elapsed_seconds"]
                 stdout_path = TASK_DIR / f"{tid}.stdout"
                 jsonl_status = _parse_jsonl_status(stdout_path)
 
-                lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
-                if not alive:
-                    lines[0] = f"=== Task {tid} (COMPLETED in {elapsed}s) ==="
+                if status == "running":
+                    lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
+                elif status == "failed":
+                    exit_code = state.get("exit_code", "?")
+                    lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
+                else:
+                    lines = [f"=== Task {tid} (COMPLETED in {elapsed}s) ==="]
 
                 # Surface thread_id from meta or stdout
+                meta = state.get("meta", {})
                 tid_thread = meta.get("thread_id")
                 if not tid_thread:
                     stdout_text = _safe_read(stdout_path)
@@ -984,6 +1278,14 @@ def _handle(request: Dict[str, Any]) -> None:
                     if thread_id:
                         header += f"\nThread ID: {thread_id}"
                     parts.append(f"{header}\n{info['result']}")
+                elif info["status"] == "failed":
+                    exit_code = info.get("exit_code", "?")
+                    header = (
+                        f"=== Task {tid} (FAILED in "
+                        f"{info['elapsed_seconds']}s, exit {exit_code}) ==="
+                    )
+                    detail = info.get("stderr") or info.get("result", "No output")
+                    parts.append(f"{header}\n{detail}")
                 elif info["status"] == "timeout":
                     parts.append(
                         f"=== Task {tid} === STILL RUNNING (wait timed out, "
