@@ -8,6 +8,7 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 
 **Unique features no other Codex MCP wrapper has:**
 
+- **Worktree isolation** -- `worktree: true` creates an isolated git worktree per task so parallel Codex instances never edit past each other
 - **Batch wait** -- launch N tasks, call `codex_wait` once, get all results when they finish
 - **Live status** -- see what each Codex task is doing right now (last tool call, current reasoning, progress)
 - **Full flag parity** -- same parameters as the official Codex MCP tool (`sandbox`, `approval-policy`, `cwd`, `model`, `config`, etc.)
@@ -74,6 +75,26 @@ The `-c` flags are identical to `codex mcp-server` -- copy-paste your existing c
    --> blocks until all finish, returns all results
 ```
 
+### Worktree isolation
+
+Prevent parallel tasks from editing the same files:
+
+```
+1. Call codex_async(prompt="Refactor auth", worktree=true)
+   --> task_id: "abc123"
+   --> Worktree Branch: codex-swarm/abc123
+
+2. Call codex_async(prompt="Add logging", worktree=true)
+   --> task_id: "def456"
+   --> Worktree Branch: codex-swarm/def456
+
+3. codex_wait(task_ids=["abc123", "def456"])
+4. git merge codex-swarm/abc123
+5. git merge codex-swarm/def456
+```
+
+Each task gets its own git worktree and branch based on HEAD. After completion, merge the branches back. Worktrees are automatically cleaned up after 24 hours (configurable via `CODEX_SWARM_TASK_MAX_AGE`).
+
 ### Live monitoring
 
 ```
@@ -112,6 +133,7 @@ All parameters from the official Codex MCP tool are supported:
 - `cwd` -- working directory
 - `profile` -- config profile from `config.toml`
 - `config` -- object of key=value overrides
+- `worktree` -- run in an isolated git worktree (prevents parallel tasks from conflicting)
 - `base-instructions`, `developer-instructions`, `compact-prompt`
 
 ## Environment variables
@@ -121,6 +143,8 @@ All parameters from the official Codex MCP tool are supported:
 | `CODEX_SWARM_LOG` | `/tmp/codex_mcp_swarm.log` | Log file path |
 | `CODEX_SWARM_LOG_LEVEL` | `WARNING` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `CODEX_SWARM_TASK_DIR` | `/tmp/codex_swarm_tasks` | Task output storage directory |
+| `CODEX_SWARM_WORKTREE_DIR` | `/tmp/codex-swarm-worktrees` | Worktree storage directory |
+| `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds before completed task artifacts (and worktrees) are cleaned up |
 
 ## Requirements
 

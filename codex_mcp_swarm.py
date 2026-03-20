@@ -39,7 +39,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -1223,7 +1223,12 @@ _CODEX_PROPERTIES = {
     },
     "worktree": {
         "type": "boolean",
-        "description": "Run the task inside an isolated git worktree and branch.",
+        "description": (
+            "Create an isolated git worktree and branch for this task. "
+            "Each task gets its own copy of the repo so parallel tasks "
+            "never conflict. The response includes the branch name "
+            "(codex-swarm/<task_id>) -- merge it back when done."
+        ),
     },
     "model": {
         "type": "string",
@@ -1270,7 +1275,9 @@ TOOLS = [
         "description": (
             "Start a Codex task in the background and return immediately "
             "with a task_id. Use codex_wait to collect results from one or "
-            "more tasks, or codex_status to monitor progress."
+            "more tasks, or codex_status to monitor progress. "
+            "Set worktree=true to isolate each task in its own git worktree "
+            "so parallel tasks don't conflict -- merge the branch back when done."
         ),
         "inputSchema": {
             "type": "object",
