@@ -39,7 +39,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -825,7 +825,7 @@ def _cleanup_old_tasks() -> None:
                 meta = json.loads(meta_file.read_text())
                 status = meta.get("status")
 
-            if status not in ("completed", "failed"):
+            if status not in ("completed", "failed", "cancelled"):
                 continue
             completed_at = meta.get("completed_at", 0)
             if now - completed_at < _TASK_MAX_AGE:
@@ -959,7 +959,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
     started_at = meta.get("started_at", time.time())
 
     # Already finalized in a previous call
-    if meta.get("status") in ("completed", "failed"):
+    if meta.get("status") in ("completed", "failed", "cancelled"):
         completed_at = meta.get("completed_at", started_at)
         return {
             "status": meta["status"],
@@ -990,7 +990,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
             meta = json.loads(meta_file.read_text())
         except Exception as exc:
             return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
-        if meta.get("status") in ("completed", "failed"):
+        if meta.get("status") in ("completed", "failed", "cancelled"):
             completed_at = meta.get("completed_at", started_at)
             return {
                 "status": meta["status"],
@@ -1165,7 +1165,7 @@ def _wait_tasks(
             if tid in results:
                 continue
             info = _check_task(tid)
-            if info["status"] in ("completed", "failed", "not_found", "error"):
+            if info["status"] in ("completed", "failed", "cancelled", "not_found", "error"):
                 results[tid] = info
             else:
                 pending.append(tid)
@@ -1355,7 +1355,164 @@ TOOLS = [
             "required": ["task_ids"],
         },
     },
+    {
+        "name": "codex_cancel",
+        "description": (
+            "Kill a running async Codex task. The process is terminated and "
+            "the task is marked as cancelled. Any worktree and partial output "
+            "are preserved for inspection."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task_id to cancel.",
+                },
+            },
+            "required": ["task_id"],
+        },
+    },
 ]
+
+# ===================================================================
+# MCP Resources -- static server info for discoverability
+# ===================================================================
+
+RESOURCES = [
+    {
+        "uri": "codex-swarm:///server-info",
+        "name": "Server Info",
+        "description": "Server version, configuration, and capabilities.",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "codex-swarm:///config",
+        "name": "Server Config",
+        "description": "Current server-level defaults and flags.",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "codex-swarm:///tasks",
+        "name": "Active Tasks",
+        "description": "List of all known async tasks and their current state.",
+        "mimeType": "application/json",
+    },
+]
+
+
+def _read_resource(uri: str) -> Optional[str]:
+    """Return resource content as JSON string, or None if unknown URI."""
+    if uri == "codex-swarm:///server-info":
+        return json.dumps({
+            "name": "codex-mcp-swarm",
+            "version": __version__,
+            "tools": [t["name"] for t in TOOLS],
+            "task_dir": str(TASK_DIR),
+            "worktree_dir": str(WORKTREE_BASE_DIR),
+            "task_max_age_seconds": _TASK_MAX_AGE,
+            "log_file": LOG_FILE,
+            "log_level": LOG_LEVEL,
+        }, indent=2)
+
+    if uri == "codex-swarm:///config":
+        return json.dumps({
+            "server_config": SERVER_CONFIG,
+            "server_flags": SERVER_FLAGS,
+        }, indent=2)
+
+    if uri == "codex-swarm:///tasks":
+        tasks = []
+        for meta_file in sorted(TASK_DIR.glob("*.meta")):
+            try:
+                meta = json.loads(meta_file.read_text())
+                task_id = meta.get("task_id", meta_file.stem)
+                state = _resolve_task_state(task_id)
+                entry = {
+                    "task_id": task_id,
+                    "status": state.get("status"),
+                    "elapsed_seconds": state.get("elapsed_seconds"),
+                }
+                for key in ("worktree_path", "worktree_branch", "thread_id"):
+                    val = meta.get(key)
+                    if val:
+                        entry[key] = val
+                tasks.append(entry)
+            except Exception:
+                continue
+        return json.dumps(tasks, indent=2)
+
+    return None
+
+
+def _cancel_task(task_id: str) -> Dict[str, Any]:
+    """Kill a running async task and mark it as cancelled."""
+    if not _validate_task_id(task_id):
+        return {"status": "error", "error": f"Invalid task ID: {task_id}"}
+
+    meta_file = TASK_DIR / f"{task_id}.meta"
+    if not meta_file.exists():
+        return {"status": "not_found", "error": f"Task {task_id} not found"}
+
+    try:
+        meta = json.loads(meta_file.read_text())
+    except Exception as exc:
+        return {"status": "error", "error": f"Bad metadata: {exc}"}
+
+    if meta.get("status") in ("completed", "failed", "cancelled"):
+        return {
+            "status": meta["status"],
+            "task_id": task_id,
+            "message": f"Task already {meta['status']}",
+        }
+
+    pid = meta.get("pid")
+    pid_start_time = meta.get("pid_start_time")
+
+    if pid and _is_alive(pid, expected_start_time=pid_start_time):
+        # Terminate the process
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logging.info("Sent SIGTERM to PID %d (task %s)", pid, task_id)
+        except ProcessLookupError:
+            pass  # already dead
+        except Exception as exc:
+            logging.warning("Failed to kill PID %d: %s", pid, exc)
+
+        # Give it a moment to exit, then force kill
+        time.sleep(0.5)
+        if _is_alive(pid, expected_start_time=pid_start_time):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logging.info("Sent SIGKILL to PID %d (task %s)", pid, task_id)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+    # Mark as cancelled in metadata
+    meta["status"] = "cancelled"
+    meta["completed_at"] = time.time()
+    try:
+        meta_file.write_text(json.dumps(meta, indent=2))
+    except Exception:
+        pass
+
+    # Cleanup in-memory tracking
+    if pid:
+        _ASYNC_PIDS.pop(pid, None)
+        _ASYNC_PROCS.pop(pid, None)
+
+    resp: Dict[str, Any] = {
+        "status": "cancelled",
+        "task_id": task_id,
+        "message": "Task cancelled",
+    }
+    if meta.get("worktree_path"):
+        resp["worktree_path"] = meta["worktree_path"]
+    if meta.get("worktree_branch"):
+        resp["worktree_branch"] = meta["worktree_branch"]
+    return resp
 
 # ===================================================================
 # Request handler
@@ -1372,7 +1529,7 @@ def _handle(request: Dict[str, Any]) -> None:
             "id": rid,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {
                     "name": "codex-mcp-swarm",
                     "version": __version__,
@@ -1394,6 +1551,33 @@ def _handle(request: Dict[str, Any]) -> None:
 
     if method == "tools/list":
         _send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+        return
+
+    if method == "resources/list":
+        _send({"jsonrpc": "2.0", "id": rid, "result": {"resources": RESOURCES}})
+        return
+
+    if method == "resources/read":
+        uri = params.get("uri", "")
+        content = _read_resource(uri)
+        if content is not None:
+            _send({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": content,
+                    }],
+                },
+            })
+        else:
+            _send({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "error": {"code": -32602, "message": f"Unknown resource: {uri}"},
+            })
         return
 
     if method == "tools/call":
@@ -1506,6 +1690,8 @@ def _handle(request: Dict[str, Any]) -> None:
                 elif status == "failed":
                     exit_code = state.get("exit_code", "?")
                     lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
+                elif status == "cancelled":
+                    lines = [f"=== Task {tid} (CANCELLED after {elapsed}s) ==="]
                 else:
                     lines = [f"=== Task {tid} (COMPLETED in {elapsed}s) ==="]
 
@@ -1594,6 +1780,17 @@ def _handle(request: Dict[str, Any]) -> None:
                         header += f"\nBranch: {info['worktree_branch']}"
                     detail = info.get("stderr") or info.get("result", "No output")
                     parts.append(f"{header}\n{detail}")
+                elif info["status"] == "cancelled":
+                    header = (
+                        f"=== Task {tid} (CANCELLED after "
+                        f"{info['elapsed_seconds']}s) ==="
+                    )
+                    if info.get("worktree_path"):
+                        header += f"\nWorktree: {info['worktree_path']}"
+                    if info.get("worktree_branch"):
+                        header += f"\nBranch: {info['worktree_branch']}"
+                    detail = info.get("result", "Task was cancelled")
+                    parts.append(f"{header}\n{detail}")
                 elif info["status"] == "timeout":
                     header = (
                         f"=== Task {tid} === STILL RUNNING (wait timed out, "
@@ -1621,6 +1818,30 @@ def _handle(request: Dict[str, Any]) -> None:
                 "id": rid,
                 "result": {
                     "content": [{"type": "text", "text": "\n\n".join(parts)}],
+                },
+            })
+
+        elif tool == "codex_cancel":
+            task_id = args.get("task_id")
+            if not task_id:
+                _send({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32602, "message": "task_id is required"},
+                })
+                return
+
+            result = _cancel_task(task_id)
+            lines = [f"Task {task_id}: {result.get('message', result.get('error', result['status']))}"]
+            if result.get("worktree_path"):
+                lines.append(f"Worktree preserved: {result['worktree_path']}")
+            if result.get("worktree_branch"):
+                lines.append(f"Branch preserved: {result['worktree_branch']}")
+            _send({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "content": [{"type": "text", "text": "\n".join(lines)}],
                 },
             })
 

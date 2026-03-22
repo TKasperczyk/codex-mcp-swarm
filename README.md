@@ -23,6 +23,7 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 | `codex_reply` | Continue a previous session via `codex exec resume` |
 | `codex_status` | Live view: tools called, last command, current thinking |
 | `codex_wait` | Block until multiple tasks complete, return all results |
+| `codex_cancel` | Kill a running async task (preserves worktree for inspection) |
 
 ## Installation
 
@@ -135,6 +136,16 @@ All parameters from the official Codex MCP tool are supported:
 - `config` -- object of key=value overrides
 - `worktree` -- run in an isolated git worktree (prevents parallel tasks from conflicting)
 - `base-instructions`, `developer-instructions`, `compact-prompt`
+
+## MCP Resources
+
+The server exposes read-only resources for discoverability:
+
+| URI | Description |
+|-----|-------------|
+| `codex-swarm:///server-info` | Version, capabilities, directories, config |
+| `codex-swarm:///config` | Current server-level defaults and flags |
+| `codex-swarm:///tasks` | All known tasks and their current state |
 
 ## Environment variables
 
