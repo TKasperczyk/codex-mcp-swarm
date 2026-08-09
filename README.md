@@ -19,7 +19,7 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 | Tool | Description |
 |------|-------------|
 | `codex` | Synchronous execution (drop-in replacement for official) |
-| `codex_async` | Fire-and-forget -- returns a `task_id` immediately |
+| `codex_async` | Fire-and-forget -- returns a `task_id` immediately. Pass `threadId` to resume a session in the background |
 | `codex_reply` | Continue a previous session via `codex exec resume` |
 | `codex_status` | Live view: tools called, last command, current thinking |
 | `codex_wait` | Block until multiple tasks complete, return all results |
@@ -114,6 +114,20 @@ Output: Analyzing error handling patterns across the codebase...
 1. Call codex(prompt="Review this file")  -->  result + session persisted
 2. Call codex_reply(threadId="<session-uuid>", prompt="Now fix the bug you found")
 ```
+
+For a follow-up that will run more than a few minutes, resume in the
+background instead -- `codex_async` accepts `threadId` and gives you a
+`task_id` that survives a client idle timeout:
+
+```
+1. Call codex_async(threadId="<session-uuid>", prompt="Now implement it")
+                                          -->  task_id: "abc123"
+2. Call codex_wait(task_ids=["abc123"])   -->  result, with full prior context
+```
+
+`codex_reply` is synchronous and emits progress notifications while it waits,
+but a client that gives up on silence will still abandon the request. Only the
+async path leaves you a handle to recover with.
 
 ## Server flags
 

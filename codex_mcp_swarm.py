@@ -39,7 +39,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -563,12 +563,34 @@ def _flatten_config(prefix: str, value: Any, out: Dict[str, str]) -> None:
 # Command builder
 # ===================================================================
 
+def _with_json_flag(cmd: List[str]) -> List[str]:
+    """
+    Insert --json after the subcommand.
+
+    Position matters: `codex exec` takes it at index 2, but `codex exec resume`
+    needs index 3 or the flag lands where the subcommand belongs.
+    """
+    if "--json" in cmd:
+        return cmd
+    idx = 3 if len(cmd) > 2 and cmd[2] == "resume" else 2
+    return cmd[:idx] + ["--json"] + cmd[idx:]
+
+
 def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     """
     Build a `codex exec` command from tool parameters + server defaults.
+
+    With params["threadId"] this builds `codex exec resume <id>` instead, so a
+    resumed session gets the same flag surface (model, sandbox, cwd, worktree)
+    as a fresh one.
+
     Returns (cmd_list, cwd_or_none).
     """
     cmd = ["codex", "exec"]
+
+    thread_id = params.get("threadId")
+    if thread_id:
+        cmd.append("resume")
 
     merged = dict(SERVER_CONFIG)
     per_call = params.get("config") or {}
@@ -621,6 +643,9 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
 
     cmd.extend(SERVER_FLAGS)
 
+    if thread_id:
+        cmd.append(str(thread_id))
+
     prompt = params.get("prompt", "")
     if prompt:
         cmd.append(prompt)
@@ -652,6 +677,73 @@ def _build_reply_command(thread_id: str, prompt: str) -> List[str]:
 # ===================================================================
 
 _POLL_INTERVAL = 2  # seconds between cancellation/timeout checks
+_PROGRESS_INTERVAL = 20  # seconds between heartbeat progress notifications
+
+# Sync children, so an abandoned or cancelled request does not leave an
+# untracked `codex exec` running with no handle anywhere in the server.
+_SYNC_PROCS: Dict[Any, subprocess.Popen] = {}
+_sync_procs_lock = threading.Lock()
+
+
+def _register_sync_proc(request_id: Any, proc: subprocess.Popen) -> None:
+    if request_id is None:
+        return
+    with _sync_procs_lock:
+        _SYNC_PROCS[request_id] = proc
+
+
+def _unregister_sync_proc(request_id: Any) -> None:
+    if request_id is None:
+        return
+    with _sync_procs_lock:
+        _SYNC_PROCS.pop(request_id, None)
+
+
+def _terminate_sync_proc(request_id: Any) -> bool:
+    """Terminate the sync child for a request, if one is still running."""
+    with _sync_procs_lock:
+        proc = _SYNC_PROCS.get(request_id)
+    if proc is None or proc.poll() is not None:
+        return False
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    logging.info("Terminated sync child pid=%s for request id=%s", proc.pid, request_id)
+    return True
+
+
+def _terminate_all_sync_procs() -> None:
+    """Kill any surviving sync children on server shutdown."""
+    with _sync_procs_lock:
+        items = list(_SYNC_PROCS.items())
+    for request_id, proc in items:
+        if proc.poll() is None:
+            logging.info("Shutdown: killing sync child pid=%s (request %s)", proc.pid, request_id)
+            proc.kill()
+
+
+def _send_progress(progress_token: Any, elapsed: float, label: str) -> None:
+    """
+    Emit an MCP progress notification.
+
+    This is what keeps a long sync run alive: the client's idle timer measures
+    silence, not duration, so a run with no wire traffic is indistinguishable
+    from a hung server no matter how much real work it is doing.
+    """
+    if progress_token is None:
+        return
+    _send({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": progress_token,
+            "progress": round(elapsed, 1),
+            "message": f"{label} running ({int(elapsed)}s elapsed)",
+        },
+    })
 
 
 def _wait_proc(
@@ -659,11 +751,15 @@ def _wait_proc(
     deadline: Optional[float] = None,
     request_id: Any = None,
     timeout_msg: str = "Error: Codex execution timed out",
+    progress_token: Any = None,
+    progress_label: str = "Codex",
 ) -> Tuple[str, Optional[str]]:
     """
-    Wait for a Popen process with cancellation and timeout support.
+    Wait for a Popen process with cancellation, timeout and progress support.
     Shared by sync codex and reply paths.
     """
+    started = time.time()
+    last_progress = started
     while True:
         remaining = None
         if deadline is not None:
@@ -689,14 +785,22 @@ def _wait_proc(
                     proc.kill()
                     proc.wait()
                 return "Cancelled by client", None
+            now = time.time()
+            if now - last_progress >= _PROGRESS_INTERVAL:
+                last_progress = now
+                _send_progress(progress_token, now - started, progress_label)
 
 
 def _run_sync(
     params: dict,
-    timeout: Optional[int] = None,
     request_id: Any = None,
+    progress_token: Any = None,
 ) -> Tuple[str, Optional[str], Optional[Dict[str, str]]]:
-    """Run codex synchronously with cancellation support."""
+    """
+    Run codex synchronously with cancellation support.
+
+    No timeout by design -- see _run_reply_sync for the reasoning.
+    """
     started_at = time.time()
     cmd_params = dict(params)
     worktree_info: Optional[Dict[str, str]] = None
@@ -721,8 +825,7 @@ def _run_sync(
 
         cmd, cwd = _build_command(cmd_params)
         # Add --json for structured output (enables thread_id extraction)
-        if "--json" not in cmd:
-            cmd.insert(2, "--json")
+        cmd = _with_json_flag(cmd)
         logging.info("Sync exec: %s", " ".join(cmd))
         proc = subprocess.Popen(
             cmd,
@@ -732,18 +835,20 @@ def _run_sync(
             text=True,
             cwd=cwd,
         )
-        deadline = time.time() + timeout if timeout is not None else None
+        _register_sync_proc(request_id, proc)
         result, thread_id = _wait_proc(
             proc,
-            deadline=deadline,
             request_id=request_id,
             timeout_msg="Error: Codex execution timed out",
+            progress_token=progress_token,
+            progress_label="Codex",
         )
         meta_status = "completed"
         return result, thread_id, worktree_info
     except Exception as exc:
         return f"Error calling Codex: {exc}", None, worktree_info
     finally:
+        _unregister_sync_proc(request_id)
         if worktree_info and run_id:
             meta = {
                 "task_id": run_id,
@@ -768,12 +873,20 @@ def _run_sync(
 def _run_reply_sync(
     thread_id: str,
     prompt: str,
-    timeout: Optional[int] = None,
     request_id: Any = None,
+    progress_token: Any = None,
 ) -> Tuple[str, Optional[str]]:
-    """Run codex reply synchronously with cancellation support."""
+    """
+    Run codex reply synchronously with cancellation support.
+
+    Deliberately has no timeout: sync tools run to completion, and callers that
+    need a bounded wait should use codex_async(threadId=...) + codex_wait.
+    Models set a low timeout here whatever the description says, which turned
+    long resumes into spurious failures.
+    """
     cmd = _build_reply_command(thread_id, prompt)
     logging.info("Reply exec: %s", " ".join(cmd))
+    proc = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -782,11 +895,16 @@ def _run_reply_sync(
             stderr=subprocess.PIPE,
             text=True,
         )
-        deadline = time.time() + timeout if timeout is not None else None
-        return _wait_proc(proc, deadline=deadline, request_id=request_id,
-                          timeout_msg="Error: Codex reply timed out")
+        _register_sync_proc(request_id, proc)
+        return _wait_proc(proc, request_id=request_id,
+                          timeout_msg="Error: Codex reply timed out",
+                          progress_token=progress_token,
+                          progress_label="Codex reply")
     except Exception as exc:
         return f"Error calling Codex reply: {exc}", None
+    finally:
+        if proc is not None:
+            _unregister_sync_proc(request_id)
 
 # ===================================================================
 # Async execution
@@ -873,8 +991,7 @@ def _start_async(params: dict) -> Dict[str, Optional[str]]:
     try:
         cmd, cwd = _build_command(cmd_params)
         # Add --json for structured output (enables live status parsing)
-        if "--json" not in cmd:
-            cmd.insert(2, "--json")
+        cmd = _with_json_flag(cmd)
         logging.info("Async start [%s]: %s", task_id, " ".join(cmd))
 
         stdout_f = TASK_DIR / f"{task_id}.stdout"
@@ -1200,6 +1317,15 @@ def _wait_tasks(
 # ===================================================================
 
 _CODEX_PROPERTIES = {
+    "threadId": {
+        "type": "string",
+        "description": (
+            "Optional session/thread ID from a previous Codex call. When set, "
+            "this resumes that conversation with full prior context instead of "
+            "starting fresh -- the async equivalent of codex_reply, and the "
+            "right choice for long follow-ups."
+        ),
+    },
     "prompt": {
         "type": "string",
         "description": "The initial user prompt for the Codex session.",
@@ -1276,6 +1402,10 @@ TOOLS = [
             "Start a Codex task in the background and return immediately "
             "with a task_id. Use codex_wait to collect results from one or "
             "more tasks, or codex_status to monitor progress. "
+            "Pass threadId to RESUME an existing session in the background -- "
+            "prefer this over codex_reply for any follow-up expected to run "
+            "more than a few minutes, since only the async path survives a "
+            "client idle timeout. "
             "Set worktree=true to isolate each task in its own git worktree "
             "so parallel tasks don't conflict -- merge the branch back when done."
         ),
@@ -1288,8 +1418,11 @@ TOOLS = [
     {
         "name": "codex_reply",
         "description": (
-            "Continue a Codex conversation by providing the thread/session ID "
-            "and a follow-up prompt. Uses `codex exec resume` under the hood."
+            "Continue a Codex conversation synchronously by providing the "
+            "thread/session ID and a follow-up prompt. Uses `codex exec resume` "
+            "under the hood. Best for short follow-ups; for anything long-running "
+            "use codex_async(threadId=..., prompt=...) instead, which returns a "
+            "task_id that survives a client idle timeout."
         ),
         "inputSchema": {
             "type": "object",
@@ -1547,6 +1680,10 @@ def _handle(request: Dict[str, Any]) -> None:
             logging.info("Client cancelled request id=%s", cancelled_id)
             with _cancelled_lock:
                 _cancelled_requests.add(cancelled_id)
+            # Kill the child immediately rather than waiting for the next
+            # 2s poll -- and, more importantly, so it cannot outlive the
+            # request as an untracked orphan.
+            _terminate_sync_proc(cancelled_id)
         return
 
     if method == "tools/list":
@@ -1583,13 +1720,16 @@ def _handle(request: Dict[str, Any]) -> None:
     if method == "tools/call":
         tool = params.get("name")
         args = params.get("arguments", {})
+        # Clients that want progress supply a token here; without one the
+        # heartbeat is a no-op and long sync runs stay silent as before.
+        progress_token = (params.get("_meta") or {}).get("progressToken")
 
         if tool == "codex":
-            timeout = args.pop("timeout", None)
+            args.pop("timeout", None)  # ignored: sync tools run to completion
             result, thread_id, worktree_info = _run_sync(
                 args,
-                timeout=timeout,
                 request_id=rid,
+                progress_token=progress_token,
             )
             text = result
             details = []
@@ -1640,7 +1780,6 @@ def _handle(request: Dict[str, Any]) -> None:
         elif tool == "codex_reply":
             thread_id = args.get("threadId")
             prompt = args.get("prompt")
-            timeout = args.get("timeout")
 
             if not thread_id or not prompt:
                 _send({
@@ -1654,7 +1793,7 @@ def _handle(request: Dict[str, Any]) -> None:
                 return
 
             text, _ = _run_reply_sync(
-                thread_id, prompt, timeout=timeout, request_id=rid
+                thread_id, prompt, request_id=rid, progress_token=progress_token
             )
             _send({
                 "jsonrpc": "2.0",
@@ -1981,6 +2120,10 @@ def main() -> None:
                 })
     except KeyboardInterrupt:
         pass
+    finally:
+        # Async tasks are detached on purpose (start_new_session) and survive;
+        # sync children belong to a request that no longer exists.
+        _terminate_all_sync_procs()
 
     logging.info("Server stopped")
 
