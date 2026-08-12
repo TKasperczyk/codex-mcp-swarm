@@ -39,7 +39,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -580,16 +580,19 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     """
     Build a `codex exec` command from tool parameters + server defaults.
 
-    With params["threadId"] this builds `codex exec resume <id>` instead, so a
-    resumed session gets the same flag surface (model, sandbox, cwd, worktree)
-    as a fresh one.
+    With params["threadId"] this builds `codex exec resume <id>` instead. The
+    resume subcommand rejects -s/-p/-C at arg-parse time (exit 2), so on
+    resume the sandbox is passed as a -c sandbox_mode override, the cwd is
+    applied via the subprocess working directory only, and a profile cannot
+    be expressed at all (`-c profile=` is rejected as legacy config).
 
     Returns (cmd_list, cwd_or_none).
     """
     cmd = ["codex", "exec"]
 
     thread_id = params.get("threadId")
-    if thread_id:
+    is_resume = bool(thread_id)
+    if is_resume:
         cmd.append("resume")
 
     merged = dict(SERVER_CONFIG)
@@ -608,9 +611,8 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     # Sandbox
     sandbox = params.get("sandbox")
     if sandbox:
-        cmd.extend(["-s", sandbox])
-        merged.pop("sandbox_mode", None)
-    elif "sandbox_mode" in merged:
+        merged["sandbox_mode"] = sandbox
+    if not is_resume and "sandbox_mode" in merged:
         cmd.extend(["-s", merged.pop("sandbox_mode")])
 
     # Approval policy (no dedicated flag -- stays as -c)
@@ -621,11 +623,18 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     # Profile
     profile = params.get("profile")
     if profile:
-        cmd.extend(["-p", profile])
+        if is_resume:
+            logging.warning(
+                "Resume of %s: dropping profile=%r "
+                "(codex exec resume has no --profile flag)",
+                thread_id, profile,
+            )
+        else:
+            cmd.extend(["-p", profile])
 
     # CWD
     cwd = params.get("cwd")
-    if cwd:
+    if cwd and not is_resume:
         cmd.extend(["-C", cwd])
 
     # Text-based params -> config keys
@@ -650,7 +659,12 @@ def _build_command(params: dict) -> Tuple[List[str], Optional[str]]:
     if prompt:
         cmd.append(prompt)
 
-    proc_cwd = cwd if cwd and os.path.isabs(cwd) else None
+    # Fresh exec passes -C, so a relative cwd resolves inside codex against
+    # the server's cwd; resume has no -C, so resolve it here instead.
+    if is_resume:
+        proc_cwd = os.path.abspath(cwd) if cwd else None
+    else:
+        proc_cwd = cwd if cwd and os.path.isabs(cwd) else None
     return cmd, proc_cwd
 
 

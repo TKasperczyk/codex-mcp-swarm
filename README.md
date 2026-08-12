@@ -146,7 +146,7 @@ All parameters from the official Codex MCP tool are supported:
 - `sandbox` -- `read-only`, `workspace-write`, `danger-full-access`
 - `approval-policy` -- `untrusted`, `on-failure`, `on-request`, `never`
 - `cwd` -- working directory
-- `profile` -- config profile from `config.toml`
+- `profile` -- config profile from `config.toml` (ignored on `threadId` resumes -- `codex exec resume` has no `--profile` flag)
 - `config` -- object of key=value overrides
 - `worktree` -- run in an isolated git worktree (prevents parallel tasks from conflicting)
 - `base-instructions`, `developer-instructions`, `compact-prompt`
