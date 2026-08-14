@@ -8,7 +8,9 @@ MCP tool.
 
 Features:
   - codex:        Synchronous execution (drop-in replacement)
-  - codex_async:  Fire-and-forget background execution
+  - codex_async:  Launch a task, return a task_id immediately (fan-out).
+                  NOT fire-and-forget: the id is server-side only, so the
+                  result reaches the caller solely via codex_wait.
   - codex_reply:  Continue a previous Codex session
   - codex_status: Live view of what each task is doing
   - codex_wait:   Block until multiple tasks complete
@@ -39,7 +41,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -64,6 +66,24 @@ WORKTREE_BASE_DIR = Path(
     os.environ.get("CODEX_SWARM_WORKTREE_DIR", "/tmp/codex-swarm-worktrees")
 )
 WORKTREE_BASE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# ---------------------------------------------------------------------------
+# Protocol negotiation
+# ---------------------------------------------------------------------------
+# Newest first. The wire surface this server actually uses (tools, resources,
+# notifications/progress) is identical across every one of these, so picking a
+# revision is a formality. It stopped being a formality when the response was
+# hardcoded to 2024-11-05: Claude Code 2.1.232 asks for 2025-11-25 and was told
+# the server speaks a revision three behind it, which opts out of everything
+# added since for no reason at all. Echo what the client asked for when we know
+# it, and fall back to our newest otherwise, which is what the spec requires.
+_SUPPORTED_PROTOCOL_VERSIONS = (
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+)
+_DEFAULT_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
 
 # ---------------------------------------------------------------------------
 # Server-level config (populated in main from CLI args)
@@ -693,6 +713,23 @@ def _build_reply_command(thread_id: str, prompt: str) -> List[str]:
 _POLL_INTERVAL = 2  # seconds between cancellation/timeout checks
 _PROGRESS_INTERVAL = 20  # seconds between heartbeat progress notifications
 
+# Claude Code moves a main-conversation tool call that is still running after
+# two minutes into a tracked background task, and re-invokes the session with
+# the result when it settles. That notification is the ONLY channel that wakes
+# an idle session, so codex_wait wants to cross this line, not duck under it.
+# A wait that returns at 115s hands the job of staying awake back to the model,
+# and a model that forgets loses the result entirely (observed 2026-08-14:
+# task 74291012 ran to completion with nobody left to collect it).
+_CLIENT_AUTO_BACKGROUND_S = 120
+
+# Floor for codex_wait, comfortably past the backgrounding threshold. Tasks
+# that are ALREADY finished still return immediately -- _wait_tasks resolves
+# every task before it ever consults the deadline -- so this only extends waits
+# that would have come back empty-handed anyway.
+_WAIT_MIN_TIMEOUT = int(
+    os.environ.get("CODEX_SWARM_MIN_WAIT", _CLIENT_AUTO_BACKGROUND_S + 30)
+)
+
 # Sync children, so an abandoned or cancelled request does not leave an
 # untracked `codex exec` running with no handle anywhere in the server.
 _SYNC_PROCS: Dict[Any, subprocess.Popen] = {}
@@ -1268,10 +1305,22 @@ def _wait_tasks(
     task_ids: List[str],
     timeout: Optional[int] = None,
     request_id: Any = None,
+    progress_token: Any = None,
 ) -> Dict[str, Any]:
-    """Block until all tasks complete, timeout, or request is cancelled."""
+    """
+    Block until all tasks complete, timeout, or request is cancelled.
+
+    Emits the same progress heartbeat as the sync path. This was missing until
+    1.9.0, which left the one code path guaranteed to run long as the only one
+    that sent nothing at all: stdio servers are subject to a 30 minute idle
+    timeout (Claude Code 2.1.203+, they were exempt before), and this tool's
+    own default timeout is 1800s. A wait on any Codex run longer than half an
+    hour was racing the client's idle timer with zero bytes on the wire.
+    """
     deadline = time.time() + timeout if timeout is not None else None
     results = {}
+    started = time.time()
+    last_progress = started
 
     while True:
         # Check if the MCP client cancelled this request
@@ -1318,6 +1367,18 @@ def _wait_tasks(
                 if meta.get("worktree_branch"):
                     results[tid]["worktree_branch"] = meta["worktree_branch"]
             break
+
+        now = time.time()
+        if now - last_progress >= _PROGRESS_INTERVAL:
+            last_progress = now
+            # _send_progress appends " running (Ns elapsed)", so the label has
+            # to be a bare noun phrase to read as a sentence.
+            waiting_on = len(pending)
+            _send_progress(
+                progress_token,
+                now - started,
+                f"{waiting_on} Codex task{'s' if waiting_on != 1 else ''}",
+            )
 
         sleep_time = 2.0
         if deadline is not None:
@@ -1413,13 +1474,19 @@ TOOLS = [
     {
         "name": "codex_async",
         "description": (
-            "Start a Codex task in the background and return immediately "
-            "with a task_id. Use codex_wait to collect results from one or "
-            "more tasks, or codex_status to monitor progress. "
-            "Pass threadId to RESUME an existing session in the background -- "
-            "prefer this over codex_reply for any follow-up expected to run "
-            "more than a few minutes, since only the async path survives a "
-            "client idle timeout. "
+            "Launch a Codex task and return immediately with a task_id, so "
+            "several can run at once. Use this to FAN OUT, then collect with "
+            "a single codex_wait. "
+            "CRITICAL: the returned task_id is internal to this server. Your "
+            "MCP client does not track it, it will not appear in your task "
+            "list, and no notification fires when the work finishes. You must "
+            "call codex_wait in the SAME turn -- if the turn ends first, the "
+            "task still completes but its result is stranded and the session "
+            "is never woken. Do not end your turn on a codex_status check "
+            "expecting to be called back, because nothing will call you back. "
+            "Pass threadId to RESUME an existing session -- prefer this over "
+            "codex_reply for any follow-up expected to run more than a few "
+            "minutes, since only the async path survives a client idle timeout. "
             "Set worktree=true to isolate each task in its own git worktree "
             "so parallel tasks don't conflict -- merge the branch back when done."
         ),
@@ -1476,12 +1543,20 @@ TOOLS = [
         "name": "codex_wait",
         "description": (
             "Block until one or more async Codex tasks complete, then return "
-            "all results. Accepts a list of task_ids. This avoids repeated "
-            "polling -- call once after launching codex_async tasks. "
-            "Default timeout is 1800s (30 min). If a task times out, it is "
-            "NOT killed -- it keeps running. You can call codex_wait again "
-            "with the same task_ids to resume waiting, or use codex_status "
-            "to check progress."
+            "all results. Accepts a list of task_ids -- pass every id you "
+            "launched in ONE call rather than waiting on them one at a time. "
+            "This is the call that actually delivers codex_async results, and "
+            "the only one that keeps the work attached to your session. "
+            "LET IT RUN LONG. A wait that outlives your client's backgrounding "
+            "threshold becomes a tracked background task, and your client "
+            "re-invokes you with the results when it settles -- that is the "
+            "behaviour you want, not something to avoid. Do NOT set a short "
+            "timeout to return before it happens: short waits are raised to a "
+            "floor anyway, and ducking under the threshold just makes you "
+            "responsible for remembering to come back. Already-finished tasks "
+            "return instantly regardless. "
+            "If the wait itself times out the task is NOT killed; call "
+            "codex_wait again with the same task_ids to resume waiting."
         ),
         "inputSchema": {
             "type": "object",
@@ -1494,8 +1569,10 @@ TOOLS = [
                 "timeout": {
                     "type": "integer",
                     "description": (
-                        "Max seconds to wait (default: 1800). "
-                        "The task keeps running even if this times out."
+                        "Max seconds to wait (default: 1800). Leave this alone "
+                        "unless you have a specific reason; values below the "
+                        "client backgrounding floor are raised to it. The task "
+                        "keeps running even if this times out."
                     ),
                 },
             },
@@ -1671,11 +1748,22 @@ def _handle(request: Dict[str, Any]) -> None:
     params = request.get("params", {})
 
     if method == "initialize":
+        requested = params.get("protocolVersion")
+        negotiated = (
+            requested
+            if requested in _SUPPORTED_PROTOCOL_VERSIONS
+            else _DEFAULT_PROTOCOL_VERSION
+        )
+        if requested != negotiated:
+            logging.info(
+                "Client requested protocol %s; responding with %s",
+                requested, negotiated,
+            )
         _send({
             "jsonrpc": "2.0",
             "id": rid,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated,
                 "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {
                     "name": "codex-mcp-swarm",
@@ -1768,17 +1856,30 @@ def _handle(request: Dict[str, Any]) -> None:
             launch_info = _start_async(args)
             task_id = launch_info["task_id"]
             lines = [
-                "Codex task started in background.",
-                f"Task ID: {task_id}",
+                f"Codex task {task_id} started.",
             ]
             if launch_info.get("worktree_path"):
                 lines.append(f"Worktree Path: {launch_info['worktree_path']}")
             if launch_info.get("worktree_branch"):
                 lines.append(f"Worktree Branch: {launch_info['worktree_branch']}")
+            # This warning exists because the old wording ("started in
+            # background") read exactly like the MCP client's own backgrounded
+            # tool calls, which DO notify on completion. A session conflated the
+            # two, ended its turn, and never collected a finished result.
             lines.extend([
                 "",
-                f'Use codex_wait(task_ids=["{task_id}"]) to wait for the result, '
-                f'or codex_status(task_ids=["{task_id}"]) to check progress.',
+                "NOT TRACKED BY YOUR CLIENT. This id is internal to "
+                "codex-swarm. No completion notification will arrive and "
+                "nothing will wake this session when the task finishes.",
+                "",
+                f'You MUST call codex_wait(task_ids=["{task_id}"]) before this '
+                "turn ends, or the result is stranded on disk with nobody to "
+                "collect it. codex_wait is the call your client tracks and the "
+                "only thing that brings the answer back.",
+                "",
+                f'codex_status(task_ids=["{task_id}"]) is a progress peek only. '
+                "It does not collect the result and it does not keep the "
+                "session alive.",
             ])
             _send({
                 "jsonrpc": "2.0",
@@ -1903,7 +2004,30 @@ def _handle(request: Dict[str, Any]) -> None:
                 })
                 return
 
-            results = _wait_tasks(task_ids, timeout=timeout, request_id=rid)
+            # Raise short waits past the client's backgrounding threshold.
+            # Callers pick values like 110 or 115 specifically to return before
+            # the client backgrounds the call, which is exactly backwards: the
+            # backgrounded call is the one whose completion re-invokes the
+            # session. Ducking under it converts a guaranteed wake-up into a
+            # promise the model has to remember to keep. Finished tasks are
+            # unaffected -- they resolve before the deadline is consulted.
+            # `timeout: null` is left alone deliberately: that means "no
+            # deadline", which already outlives the threshold.
+            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+                if timeout < _WAIT_MIN_TIMEOUT:
+                    logging.info(
+                        "Raising codex_wait timeout %ss -> %ss to cross the "
+                        "client's %ss auto-background threshold",
+                        timeout, _WAIT_MIN_TIMEOUT, _CLIENT_AUTO_BACKGROUND_S,
+                    )
+                    timeout = _WAIT_MIN_TIMEOUT
+
+            results = _wait_tasks(
+                task_ids,
+                timeout=timeout,
+                request_id=rid,
+                progress_token=progress_token,
+            )
 
             parts = []
             for tid in task_ids:

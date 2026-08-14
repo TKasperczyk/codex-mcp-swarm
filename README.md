@@ -19,7 +19,7 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 | Tool | Description |
 |------|-------------|
 | `codex` | Synchronous execution (drop-in replacement for official) |
-| `codex_async` | Fire-and-forget -- returns a `task_id` immediately. Pass `threadId` to resume a session in the background |
+| `codex_async` | Launch a task, get a `task_id` immediately (fan-out). **Not** fire-and-forget: results come back only via `codex_wait`. Pass `threadId` to resume a session |
 | `codex_reply` | Continue a previous session via `codex exec resume` |
 | `codex_status` | Live view: tools called, last command, current thinking |
 | `codex_wait` | Block until multiple tasks complete, return all results |
@@ -75,6 +75,25 @@ The `-c` flags are identical to `codex mcp-server` -- copy-paste your existing c
 4. Call codex_wait(task_ids=["abc123", "def456", "ghi789"])
    --> blocks until all finish, returns all results
 ```
+
+### Collecting results: read this before you fan out
+
+A `task_id` is internal to this server. **Your MCP client does not track it.**
+It will not appear in a task list, and no notification fires when the task
+finishes. If the agent's turn ends before `codex_wait` is called, the Codex run
+still completes and writes its result to disk, but nothing is left to deliver
+it and nothing wakes the session. `codex_status` is a progress peek only; it
+collects nothing.
+
+So: **`codex_async` and `codex_wait` belong in the same turn.**
+
+Let the wait run long. Claude Code moves any main-conversation tool call still
+running after two minutes into a tracked background task and re-invokes the
+session with the result when it settles -- that is the wake-up mechanism, so
+crossing the two-minute line is the goal rather than something to dodge. Short
+`timeout` values are raised to a floor (default 150s, override with
+`CODEX_SWARM_MIN_WAIT`) for exactly this reason. Tasks that have already
+finished return instantly regardless of the floor.
 
 ### Worktree isolation
 
@@ -170,6 +189,7 @@ The server exposes read-only resources for discoverability:
 | `CODEX_SWARM_TASK_DIR` | `/tmp/codex_swarm_tasks` | Task output storage directory |
 | `CODEX_SWARM_WORKTREE_DIR` | `/tmp/codex-swarm-worktrees` | Worktree storage directory |
 | `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds before completed task artifacts (and worktrees) are cleaned up |
+| `CODEX_SWARM_MIN_WAIT` | `150` | Floor in seconds for `codex_wait`. Keeps the call above the client's 2-minute auto-backgrounding threshold so completion re-invokes the session. Already-finished tasks ignore it |
 
 ## Requirements
 
