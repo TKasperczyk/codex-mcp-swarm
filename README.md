@@ -95,6 +95,26 @@ crossing the two-minute line is the goal rather than something to dodge. Short
 `CODEX_SWARM_MIN_WAIT`) for exactly this reason. Tasks that have already
 finished return instantly regardless of the floor.
 
+### A reported failure is not proof of failure
+
+`codex exec` writes progress, warnings and sandbox notices to stderr on
+perfectly healthy runs. Until 1.10.0, a task whose exit code was lost to a
+reaping race was marked **failed** on the strength of non-empty stderr alone,
+so finished work got reported as a failure and callers acted on it.
+
+The verdict now comes from the run's own output: a completed `agent_message`
+in the JSONL means the run reached the end, whatever stderr says. When the
+exit code really was lost, the result carries `exit_code_lost` and the output
+says the verdict is inferred rather than observed, along with what to check.
+
+Two things follow for anyone consuming this server:
+
+- A `FAILED` from `codex_status` or `codex_wait` that is flagged as inferred is
+  a prompt to verify, not a conclusion. Check `pgrep -af 'codex exec'`, file
+  mtimes, the worktree branch, and your own build or tests.
+- A `codex_wait` that times out is **not** a failure at all. The task is not
+  killed. Call `codex_wait` again with the same `task_id`.
+
 ### Worktree isolation
 
 Prevent parallel tasks from editing the same files:

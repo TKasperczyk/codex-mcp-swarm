@@ -41,7 +41,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -730,6 +730,23 @@ _WAIT_MIN_TIMEOUT = int(
     os.environ.get("CODEX_SWARM_MIN_WAIT", _CLIENT_AUTO_BACKGROUND_S + 30)
 )
 
+# A wrapper-level "failure" is not proof the Codex run died or that its edits
+# never landed. Both of these are attached to output that callers have
+# historically acted on as if it were a clean failure.
+_UNVERIFIED_FAILURE_HINT = (
+    "NOTE: this verdict is inferred, not observed -- the exit code was lost to "
+    "a reaping race, so the status was derived from output alone. Codex may "
+    "have finished its work. Verify before reporting failure upstream: run "
+    "`pgrep -af 'codex exec'` to see whether it is still alive, then check "
+    "file mtimes, the worktree branch, and your own build/tests."
+)
+
+_STILL_RUNNING_HINT = (
+    "This is NOT a failure. The task was not killed and is still working. Call "
+    "codex_wait again with the same task_id to keep waiting, or check "
+    "`pgrep -af 'codex exec'`."
+)
+
 # Sync children, so an abandoned or cancelled request does not leave an
 # untracked `codex exec` running with no handle anywhere in the server.
 _SYNC_PROCS: Dict[Any, subprocess.Popen] = {}
@@ -1135,6 +1152,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
             "meta": meta,
             "elapsed_seconds": int(completed_at - started_at),
             "exit_code": meta.get("exit_code"),
+            "exit_code_lost": bool(meta.get("exit_code_lost")),
         }
 
     pid = meta.get("pid")
@@ -1166,6 +1184,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
                 "meta": meta,
                 "elapsed_seconds": int(completed_at - started_at),
                 "exit_code": meta.get("exit_code"),
+                "exit_code_lost": bool(meta.get("exit_code_lost")),
             }
 
         # Determine exit code.
@@ -1213,11 +1232,22 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         # timestamp, causing premature cleanup.
         completed_at = time.time()
 
-        # exit_code None means we lost it (race) -- check stderr for error clues
+        # exit_code None means we lost it to a reaping race. Non-empty stderr
+        # is NOT evidence of failure: codex writes progress, warnings and
+        # sandbox notices there on perfectly healthy runs, so the old check
+        # reported finished work as failed and callers acted on that verdict
+        # (observed: a task marked failed that had written several modules
+        # with 80 tests passing). A completed agent_message in the JSONL is
+        # real evidence the run reached the end -- prefer it, and fall back to
+        # the stderr heuristic only when there is no such message at all.
+        exit_code_lost = exit_code is None
         if exit_code is None:
-            stderr_text = _safe_read(TASK_DIR / f"{task_id}.stderr").strip()
-            if stderr_text:
-                # Non-empty stderr with unknown exit code -- assume failure
+            final_text, _ = _extract_from_jsonl(
+                _safe_read(TASK_DIR / f"{task_id}.stdout")
+            )
+            if final_text:
+                final_status = "completed"
+            elif _safe_read(TASK_DIR / f"{task_id}.stderr").strip():
                 final_status = "failed"
             else:
                 final_status = "completed"
@@ -1231,6 +1261,9 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         meta["completed_at"] = completed_at
         if exit_code is not None:
             meta["exit_code"] = exit_code
+        if exit_code_lost:
+            # Verdict was inferred from output, not observed from a wait status.
+            meta["exit_code_lost"] = True
         try:
             meta_file.write_text(json.dumps(meta, indent=2))
         except Exception:
@@ -1246,6 +1279,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         "meta": meta,
         "elapsed_seconds": int(completed_at - started_at),
         "exit_code": exit_code,
+        "exit_code_lost": exit_code_lost,
     }
 
 
@@ -1296,6 +1330,7 @@ def _check_task(task_id: str) -> Dict[str, Any]:
         resp["thread_id"] = thread_id
     if status == "failed":
         resp["exit_code"] = state.get("exit_code")
+        resp["exit_code_lost"] = bool(state.get("exit_code_lost"))
         if stderr and stderr.strip():
             resp["stderr"] = stderr.strip()[-500:]
     return resp
@@ -1462,8 +1497,14 @@ TOOLS = [
     {
         "name": "codex",
         "description": (
-            "Run a Codex session synchronously. "
-            "Parameters match the official Codex MCP tool."
+            "Run a Codex session synchronously. Parameters match the official "
+            "Codex MCP tool. This server applies NO timeout of its own, but MCP "
+            "clients do -- Claude Code cuts a tool call at roughly 300s by "
+            "default -- and when the client gives up, the result is lost even "
+            "though the underlying `codex exec` keeps running to completion. "
+            "Use codex_async + codex_wait for anything that might run longer "
+            "than a couple of minutes, and whenever you want more than one "
+            "session at a time."
         ),
         "inputSchema": {
             "type": "object",
@@ -1525,7 +1566,14 @@ TOOLS = [
         "description": (
             "Get live status of running async Codex tasks. Shows what each "
             "task is currently doing: last tool call, reasoning, progress. "
-            "Works on both running and completed tasks."
+            "Works on both running and completed tasks. This is a read-only "
+            "peek: it collects nothing and does not keep a task attached to "
+            "your session -- only codex_wait does that, so never end a turn on "
+            "a status check expecting to be called back. A FAILED verdict here "
+            "is not always authoritative: when the exit code is lost to a "
+            "reaping race the status is inferred from output alone, and the "
+            "response says so explicitly. Verify before treating a reported "
+            "failure as proof the work did not land."
         ),
         "inputSchema": {
             "type": "object",
@@ -1944,6 +1992,8 @@ def _handle(request: Dict[str, Any]) -> None:
                 elif status == "failed":
                     exit_code = state.get("exit_code", "?")
                     lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
+                    if state.get("exit_code_lost"):
+                        lines.append(_UNVERIFIED_FAILURE_HINT)
                 elif status == "cancelled":
                     lines = [f"=== Task {tid} (CANCELLED after {elapsed}s) ==="]
                 else:
@@ -2056,6 +2106,8 @@ def _handle(request: Dict[str, Any]) -> None:
                     if info.get("worktree_branch"):
                         header += f"\nBranch: {info['worktree_branch']}"
                     detail = info.get("stderr") or info.get("result", "No output")
+                    if info.get("exit_code_lost"):
+                        detail = f"{_UNVERIFIED_FAILURE_HINT}\n\n{detail}"
                     parts.append(f"{header}\n{detail}")
                 elif info["status"] == "cancelled":
                     header = (
@@ -2078,7 +2130,7 @@ def _handle(request: Dict[str, Any]) -> None:
                         header += f"\nWorktree: {info['worktree_path']}"
                     if info.get("worktree_branch"):
                         header += f"\nBranch: {info['worktree_branch']}"
-                    parts.append(header)
+                    parts.append(f"{header}\n{_STILL_RUNNING_HINT}")
                 else:
                     header = (
                         f"=== Task {tid} === "
