@@ -18,12 +18,12 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 
 | Tool | Description |
 |------|-------------|
-| `codex` | Synchronous execution (drop-in replacement for official) |
+| `codex` | Synchronous execution (drop-in replacement for official); terminal failures include the model, structured cause, category, and retryability |
 | `codex_async` | Launch a task, get a `task_id` immediately (fan-out). **Not** fire-and-forget: results come back only via `codex_wait`. Pass `threadId` to resume a session |
-| `codex_reply` | Continue a previous session via `codex exec resume` |
-| `codex_status` | Live view: tools called, last command, current thinking |
-| `codex_wait` | Block until multiple tasks complete, return all results |
-| `codex_cancel` | Kill a running async task (preserves worktree for inspection) |
+| `codex_reply` | Continue a previous session via `codex exec resume`; uses the same structured failure reporting as `codex` |
+| `codex_status` | Live view: tools called, last command, current thinking, warnings, and terminal failure cause |
+| `codex_wait` | Block until multiple tasks complete and return results or structured failure details |
+| `codex_cancel` | Kill a running async task (preserves worktree for inspection); if it already failed, return the recorded cause |
 
 ## Installation
 
@@ -95,17 +95,31 @@ crossing the two-minute line is the goal rather than something to dodge. Short
 `CODEX_SWARM_MIN_WAIT`) for exactly this reason. Tasks that have already
 finished return instantly regardless of the floor.
 
-### A reported failure is not proof of failure
+### Failure reporting and terminal precedence
 
 `codex exec` writes progress, warnings and sandbox notices to stderr on
 perfectly healthy runs. Until 1.10.0, a task whose exit code was lost to a
 reaping race was marked **failed** on the strength of non-empty stderr alone,
 so finished work got reported as a failure and callers acted on it.
 
-The verdict now comes from the run's own output: a completed `agent_message`
-in the JSONL means the run reached the end, whatever stderr says. When the
-exit code really was lost, the result carries `exit_code_lost` and the output
-says the verdict is inferred rather than observed, along with what to check.
+Version 1.11.0 uses the terminal events in `codex exec --json` as the primary
+lifecycle signal. An unambiguous `turn.completed` means success even if an
+earlier top-level `error` event was emitted while the CLI retried. An
+unambiguous `turn.failed` means failure even if an earlier, partial
+`agent_message` exists. Top-level `error` events are diagnostic rather than
+terminal, because the public JSONL omits the CLI's internal `will_retry` field;
+`item.completed` events whose item type is `error` are warnings. If terminal
+events are absent or contradict each other, an observed process exit code
+decides the result. Only a verdict made without either signal is marked as
+inferred, and both completion and failure outputs label that explicitly.
+
+Terminal failures report the model parsed from the command that actually ran,
+the structured `turn.failed.error.message`, a failure category, whether a later
+retry is likely to be useful, and a suggested action. Retryability is
+information only: the wrapper never starts a second Codex turn. The Codex CLI
+may perform its own in-turn retries. Stderr can be included as a clearly
+labeled, truncated diagnostics section, but it never replaces the primary
+failure cause.
 
 Two things follow for anyone consuming this server:
 
@@ -198,7 +212,7 @@ The server exposes read-only resources for discoverability:
 |-----|-------------|
 | `codex-swarm:///server-info` | Version, capabilities, directories, config |
 | `codex-swarm:///config` | Current server-level defaults and flags |
-| `codex-swarm:///tasks` | All known tasks and their current state |
+| `codex-swarm:///tasks` | All known tasks and their current state; failed entries include model, cause, category, and retryability |
 
 ## Environment variables
 

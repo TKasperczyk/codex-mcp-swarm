@@ -14,8 +14,15 @@ import time
 import json
 import types
 import threading
+import atexit
+import shutil
+import tempfile
 
-os.environ.setdefault("CODEX_SWARM_TASK_DIR", "/tmp/codex_swarm_tasks_test")
+TEST_ROOT = tempfile.mkdtemp(prefix="codex_swarm_test_190_")
+atexit.register(shutil.rmtree, TEST_ROOT, True)
+os.environ["CODEX_SWARM_TASK_DIR"] = os.path.join(TEST_ROOT, "tasks")
+os.environ["CODEX_SWARM_WORKTREE_DIR"] = os.path.join(TEST_ROOT, "worktrees")
+os.environ["CODEX_SWARM_LOG"] = os.path.join(TEST_ROOT, "server.log")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import codex_mcp_swarm as m  # noqa: E402
 

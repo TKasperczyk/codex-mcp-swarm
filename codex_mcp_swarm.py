@@ -37,11 +37,12 @@ import signal
 import traceback
 import argparse
 import re
+import shlex
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -389,66 +390,328 @@ def _validate_task_id(task_id: str) -> bool:
     return bool(_TASK_ID_RE.match(task_id))
 
 
-def _extract_result(stdout: str, stderr: str) -> Tuple[str, Optional[str]]:
-    """Extract result and thread ID from codex output. Returns (text, thread_id)."""
-    if stdout.strip().startswith("{"):
-        text, thread_id = _extract_from_jsonl(stdout)
-        if text:
-            return text, thread_id
-    result = stdout.strip()
-    if not result and stderr:
-        result = stderr.strip()
-    return result or "No output from Codex", None
+def _error_message(value: Any) -> Optional[str]:
+    """Return a non-empty message from a public exec error payload."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    if isinstance(value, dict):
+        message = value.get("message")
+        if isinstance(message, str):
+            message = message.strip()
+            return message or None
+    return None
 
 
-def _extract_from_jsonl(jsonl_text: str) -> Tuple[Optional[str], Optional[str]]:
+def _analyze_jsonl(jsonl_text: str) -> Dict[str, Any]:
+    """Analyze exec/session JSONL without treating diagnostic errors as terminal.
+
+    Codex 0.151 emits retryable stream errors as top-level ``error`` events but
+    strips the internal ``will_retry`` flag from public JSONL. Consequently only
+    ``turn.completed`` and ``turn.failed`` are terminal. Error items are warnings.
+    If both terminal event types occur, the stream is contradictory and the
+    caller must prefer an observed process exit code.
     """
-    Extract the final assistant message and thread ID from JSONL output.
-    Handles both `codex exec --json` format (item.completed/agent_message)
-    and session file format (response_item/assistant).
-    """
-    last_assistant_text = None
-    thread_id = None
+    analysis: Dict[str, Any] = {
+        "thread_id": None,
+        "last_assistant_text": None,
+        "errors": [],
+        "warnings": [],
+        "terminal_events": [],
+        "terminal_status": None,
+        "terminal_error": None,
+        "terminal_conflict": False,
+        "saw_json": False,
+        "saw_turn_started": False,
+    }
+
     for line in jsonl_text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-            etype = event.get("type", "")
-
-            # -- thread/session ID extraction
-            if etype == "thread.started":
-                thread_id = event.get("thread_id")
-            elif etype == "session_meta":
-                payload = event.get("payload", {})
-                if not thread_id:
-                    thread_id = payload.get("id")
-
-            # -- codex exec --json format
-            elif etype == "item.completed":
-                item = event.get("item", {})
-                if item.get("type") == "agent_message":
-                    text = item.get("text", "")
-                    if text:
-                        last_assistant_text = text
-
-            # -- session file format (fallback)
-            elif etype == "response_item":
-                payload = event.get("payload", {})
-                if payload.get("role") == "assistant" and payload.get("type") == "message":
-                    content = payload.get("content") or []
-                    texts = [
-                        c.get("text", "")
-                        for c in content
-                        if c.get("type") in ("output_text", "text", "input_text")
-                    ]
-                    if texts:
-                        last_assistant_text = "\n".join(texts)
-
-        except (json.JSONDecodeError, KeyError):
+        except json.JSONDecodeError:
             continue
-    return last_assistant_text, thread_id
+        if not isinstance(event, dict):
+            continue
+
+        analysis["saw_json"] = True
+        etype = event.get("type", "")
+
+        if etype == "thread.started":
+            analysis["thread_id"] = event.get("thread_id")
+        elif etype == "session_meta":
+            payload = event.get("payload", {})
+            if isinstance(payload, dict) and not analysis["thread_id"]:
+                analysis["thread_id"] = payload.get("id")
+
+        if etype == "turn.started":
+            analysis["saw_turn_started"] = True
+        elif etype == "turn.completed":
+            analysis["terminal_events"].append("completed")
+        elif etype == "turn.failed":
+            analysis["terminal_events"].append("failed")
+            message = _error_message(event.get("error"))
+            if message:
+                analysis["terminal_error"] = message
+        elif etype == "error":
+            # Non-terminal: this may be a retry notification whose will_retry
+            # flag was removed by the public exec JSONL representation.
+            message = _error_message(event.get("message")) or _error_message(
+                event.get("error")
+            )
+            if message:
+                analysis["errors"].append(message)
+        elif etype == "item.completed":
+            item = event.get("item", {})
+            if isinstance(item, dict):
+                itype = item.get("type")
+                if itype == "agent_message":
+                    text = item.get("text", "")
+                    if isinstance(text, str) and text:
+                        analysis["last_assistant_text"] = text
+                elif itype == "error":
+                    # Config notices, runtime warnings and model reroutes use
+                    # this form. They are explicitly non-terminal.
+                    message = _error_message(item.get("message")) or _error_message(
+                        item.get("error")
+                    )
+                    if message:
+                        analysis["warnings"].append(message)
+        elif etype == "response_item":
+            # Session rollout format (fallback for callers that inspect one).
+            payload = event.get("payload", {})
+            if (
+                isinstance(payload, dict)
+                and payload.get("role") == "assistant"
+                and payload.get("type") == "message"
+            ):
+                content = payload.get("content") or []
+                texts = [
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict)
+                    and c.get("type") in ("output_text", "text", "input_text")
+                ]
+                if texts:
+                    analysis["last_assistant_text"] = "\n".join(texts)
+        elif etype == "event_msg":
+            # Persisted rollouts use event_msg rather than public exec events.
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            ptype = payload.get("type")
+            if ptype == "task_started":
+                analysis["saw_turn_started"] = True
+            elif ptype == "task_complete":
+                analysis["terminal_events"].append("completed")
+                message = payload.get("last_agent_message")
+                if isinstance(message, str) and message:
+                    analysis["last_assistant_text"] = message
+            elif ptype == "turn_aborted":
+                analysis["terminal_events"].append("failed")
+                reason = payload.get("reason")
+                if isinstance(reason, str) and reason:
+                    analysis["terminal_error"] = f"Turn aborted: {reason}"
+            elif ptype == "error":
+                message = _error_message(payload.get("message")) or _error_message(
+                    payload.get("error")
+                )
+                if message:
+                    analysis["errors"].append(message)
+
+    terminal_types = set(analysis["terminal_events"])
+    if len(terminal_types) == 1:
+        analysis["terminal_status"] = next(iter(terminal_types))
+    elif len(terminal_types) > 1:
+        analysis["terminal_conflict"] = True
+    return analysis
+
+
+def _decide_run_status(
+    exit_code: Optional[int], analysis: Dict[str, Any], stderr: str
+) -> Tuple[str, bool]:
+    """Return (status, inferred) using terminal events, then the exit code."""
+    terminal_status = analysis.get("terminal_status")
+    if terminal_status in ("completed", "failed"):
+        return terminal_status, False
+
+    # Missing or contradictory terminal signals defer to the observed process.
+    if exit_code is not None:
+        return ("failed" if exit_code != 0 else "completed"), False
+
+    # Exit-code-lost compatibility fallback from 1.10.0. Agent output is useful
+    # evidence of completion; stderr is only a weak, explicitly inferred signal.
+    if analysis.get("last_assistant_text"):
+        return "completed", True
+    if stderr.strip():
+        return "failed", True
+    return "completed", True
+
+
+def _model_from_command(command: Any) -> Optional[str]:
+    """Extract the effective ``-m`` or ``-c model=`` value from task metadata."""
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    for index, token in enumerate(tokens):
+        if token in ("-m", "--model") and index + 1 < len(tokens):
+            return tokens[index + 1]
+        if token.startswith("--model="):
+            return token.split("=", 1)[1] or None
+
+    for index, token in enumerate(tokens):
+        config_value = None
+        if token in ("-c", "--config") and index + 1 < len(tokens):
+            config_value = tokens[index + 1]
+        elif token.startswith("--config="):
+            config_value = token.split("=", 1)[1]
+        if config_value and config_value.startswith("model="):
+            return config_value.split("=", 1)[1] or None
+    return None
+
+
+def _classify_failure(message: str) -> Dict[str, Any]:
+    """Conservatively classify a final failure; retryability is information only."""
+    lower = message.lower()
+    category = "unknown"
+    retryable: Optional[bool] = None
+    action = "Inspect the structured cause and diagnostics before retrying."
+
+    if any(term in lower for term in (
+        "refresh token", "token has been revoked", "revoked token",
+        "unauthorized", "authentication failed", "not authenticated",
+    )) or re.search(r"\b401\b", lower):
+        category, retryable = "authentication", False
+        action = "Reauthenticate Codex before starting another run."
+    elif any(term in lower for term in (
+        "at capacity", "model capacity", "high demand", "provider capacity",
+        "server overloaded", "service overloaded",
+    )):
+        category, retryable = "provider_capacity", True
+        action = "Retry later, or ask the server operator to change the configured model."
+    elif any(term in lower for term in (
+        "rate limit", "rate-limit", "too many requests", "quota temporarily",
+    )) or re.search(r"\b429\b", lower):
+        category, retryable = "rate_limit", True
+        action = "Retry after the provider limit resets."
+    elif any(term in lower for term in (
+        "internal server error", "bad gateway", "service unavailable",
+        "gateway timeout",
+    )) or re.search(r"\b5\d\d\b", lower):
+        category, retryable = "provider_5xx", True
+        action = "Retry later; the provider or an upstream gateway failed."
+    elif any(term in lower for term in (
+        "stream disconnected", "connection reset", "connection failed",
+        "network error", "timed out", "timeout",
+    )):
+        category, retryable = "transport", True
+        action = "Retry after checking network and provider availability."
+    elif any(term in lower for term in (
+        "invalid request", "bad request", "invalid prompt", "unsupported",
+        "model not found", "unknown model",
+    )) or re.search(r"\b400\b", lower):
+        category, retryable = "invalid_request", False
+        action = "Correct the request or server configuration before retrying."
+    elif any(term in lower for term in (
+        "panicked at", "panic", "segmentation fault", "fatal runtime error",
+        "agent loop died unexpectedly", "signal 11",
+    )):
+        category = "process_crash"
+        action = "Inspect the diagnostics; retryability is unknown."
+
+    return {"category": category, "retryable": retryable, "action": action}
+
+
+def _build_failure_info(
+    stdout: str,
+    stderr: str,
+    command: Any = None,
+    analysis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a clean primary cause plus explicitly secondary diagnostics."""
+    analysis = analysis or _analyze_jsonl(stdout)
+    cause = analysis.get("terminal_error")
+    if not cause and analysis.get("errors"):
+        cause = analysis["errors"][-1]
+
+    raw_stdout = stdout.strip()
+    stdout_diagnostics = None
+    if not cause and raw_stdout and not analysis.get("saw_json"):
+        cause = raw_stdout
+    elif not cause and raw_stdout:
+        stdout_diagnostics = raw_stdout[-1000:]
+
+    if not cause:
+        cause = "Codex exited without a structured failure message."
+
+    classification_input = cause
+    if classification_input.startswith("Codex exited without") and stderr.strip():
+        classification_input = f"{classification_input}\n{stderr}"
+    classification = _classify_failure(classification_input)
+
+    info: Dict[str, Any] = {
+        "cause": cause,
+        "model": _model_from_command(command),
+        **classification,
+    }
+    if stdout_diagnostics:
+        info["stdout_diagnostics"] = stdout_diagnostics
+    if stderr.strip():
+        info["stderr_diagnostics"] = stderr.strip()[-500:]
+    return info
+
+
+def _format_failure_info(
+    info: Dict[str, Any], include_diagnostics: bool = True
+) -> str:
+    retryable = info.get("retryable")
+    retryable_text = "yes" if retryable is True else "no" if retryable is False else "unknown"
+    lines = [
+        f"Model: {info.get('model') or 'unknown'}",
+        f"Cause: {info.get('cause', 'Unknown Codex failure')}",
+        f"Category: {info.get('category', 'unknown')}",
+        f"Retryable: {retryable_text} (informational only; the wrapper did not retry)",
+    ]
+    if info.get("action"):
+        lines.append(f"Action: {info['action']}")
+    if include_diagnostics and info.get("stdout_diagnostics"):
+        lines.extend([
+            "",
+            "Output (stdout; no structured cause was found):",
+            info["stdout_diagnostics"],
+        ])
+    if include_diagnostics and info.get("stderr_diagnostics"):
+        lines.extend([
+            "",
+            "Diagnostics (stderr tail; not the failure cause):",
+            info["stderr_diagnostics"],
+        ])
+    return "\n".join(lines)
+
+
+def _extract_result(
+    stdout: str, stderr: str, analysis: Optional[Dict[str, Any]] = None
+) -> Tuple[str, Optional[str]]:
+    """Extract result and thread ID from codex output. Returns (text, thread_id)."""
+    analysis = analysis or _analyze_jsonl(stdout)
+    if stdout.strip().startswith("{") and analysis.get("last_assistant_text"):
+        return analysis["last_assistant_text"], analysis.get("thread_id")
+    result = stdout.strip()
+    if not result and stderr:
+        result = stderr.strip()
+    return result or "No output from Codex", analysis.get("thread_id")
+
+
+def _extract_from_jsonl(jsonl_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract the final assistant message and thread ID from analyzed JSONL."""
+    analysis = _analyze_jsonl(jsonl_text)
+    return analysis.get("last_assistant_text"), analysis.get("thread_id")
 
 
 def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
@@ -463,6 +726,10 @@ def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
         "last_tool_args": None,
         "last_reasoning": None,
         "last_assistant_text": None,
+        "last_error": None,
+        "last_warning": None,
+        "terminal_error": None,
+        "terminal_conflict": False,
     }
 
     if not stdout_path.exists():
@@ -472,6 +739,8 @@ def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
         text = stdout_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return status
+
+    analysis = _analyze_jsonl(text)
 
     for line in text.splitlines():
         line = line.strip()
@@ -548,6 +817,15 @@ def _parse_jsonl_status(stdout_path: Path) -> Dict[str, Any]:
                     if c.get("type") in ("output_text", "text", "input_text"):
                         status["last_assistant_text"] = c.get("text", "")[-300:]
 
+    terminal_status = analysis.get("terminal_status")
+    if terminal_status:
+        status["phase"] = terminal_status
+    elif analysis.get("terminal_conflict"):
+        status["phase"] = "unknown (conflicting terminal events)"
+    status["last_error"] = analysis["errors"][-1] if analysis["errors"] else None
+    status["last_warning"] = analysis["warnings"][-1] if analysis["warnings"] else None
+    status["terminal_error"] = analysis.get("terminal_error")
+    status["terminal_conflict"] = bool(analysis.get("terminal_conflict"))
     return status
 
 
@@ -741,6 +1019,12 @@ _UNVERIFIED_FAILURE_HINT = (
     "file mtimes, the worktree branch, and your own build/tests."
 )
 
+_UNVERIFIED_COMPLETION_HINT = (
+    "NOTE: this completion verdict is inferred, not observed -- neither an "
+    "unambiguous terminal event nor the process exit code was available. "
+    "Verify the returned output and your own build/tests before relying on it."
+)
+
 _STILL_RUNNING_HINT = (
     "This is NOT a failure. The task was not killed and is still working. Call "
     "codex_wait again with the same task_id to keep waiting, or check "
@@ -821,7 +1105,8 @@ def _wait_proc(
     timeout_msg: str = "Error: Codex execution timed out",
     progress_token: Any = None,
     progress_label: str = "Codex",
-) -> Tuple[str, Optional[str]]:
+    command: Any = None,
+) -> Tuple[str, Optional[str], bool]:
     """
     Wait for a Popen process with cancellation, timeout and progress support.
     Shared by sync codex and reply paths.
@@ -839,11 +1124,24 @@ def _wait_proc(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-                return timeout_msg, None
+                return timeout_msg, None, True
         wait_time = min(_POLL_INTERVAL, remaining) if remaining is not None else _POLL_INTERVAL
         try:
             stdout, stderr = proc.communicate(timeout=wait_time)
-            return _extract_result(stdout, stderr)
+            analysis = _analyze_jsonl(stdout)
+            status, _ = _decide_run_status(proc.returncode, analysis, stderr)
+            if status == "failed":
+                failure = _build_failure_info(
+                    stdout, stderr, command=command, analysis=analysis
+                )
+                exit_code = proc.returncode if proc.returncode is not None else "?"
+                text = (
+                    f"{progress_label} FAILED (exit {exit_code})\n"
+                    f"{_format_failure_info(failure)}"
+                )
+                return text, analysis.get("thread_id"), True
+            result, thread_id = _extract_result(stdout, stderr, analysis=analysis)
+            return result, thread_id, False
         except subprocess.TimeoutExpired:
             if request_id is not None and _is_cancelled(request_id):
                 proc.terminate()
@@ -852,7 +1150,7 @@ def _wait_proc(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-                return "Cancelled by client", None
+                return "Cancelled by client", None, True
             now = time.time()
             if now - last_progress >= _PROGRESS_INTERVAL:
                 last_progress = now
@@ -875,6 +1173,7 @@ def _run_sync(
     run_id: Optional[str] = None
     cmd: List[str] = []
     thread_id: Optional[str] = None
+    exit_code: Optional[int] = None
     meta_status = "failed"
 
     worktree_enabled = bool(cmd_params.pop("worktree", False))
@@ -904,14 +1203,16 @@ def _run_sync(
             cwd=cwd,
         )
         _register_sync_proc(request_id, proc)
-        result, thread_id = _wait_proc(
+        result, thread_id, failed = _wait_proc(
             proc,
             request_id=request_id,
             timeout_msg="Error: Codex execution timed out",
             progress_token=progress_token,
             progress_label="Codex",
+            command=" ".join(cmd),
         )
-        meta_status = "completed"
+        exit_code = proc.returncode
+        meta_status = "failed" if failed else "completed"
         return result, thread_id, worktree_info
     except Exception as exc:
         return f"Error calling Codex: {exc}", None, worktree_info
@@ -929,6 +1230,8 @@ def _run_sync(
             }
             if cmd:
                 meta["command"] = " ".join(cmd)
+            if exit_code is not None:
+                meta["exit_code"] = exit_code
             if thread_id:
                 meta["thread_id"] = thread_id
             try:
@@ -952,7 +1255,7 @@ def _run_reply_sync(
     Models set a low timeout here whatever the description says, which turned
     long resumes into spurious failures.
     """
-    cmd = _build_reply_command(thread_id, prompt)
+    cmd = _with_json_flag(_build_reply_command(thread_id, prompt))
     logging.info("Reply exec: %s", " ".join(cmd))
     proc = None
     try:
@@ -964,10 +1267,15 @@ def _run_reply_sync(
             text=True,
         )
         _register_sync_proc(request_id, proc)
-        return _wait_proc(proc, request_id=request_id,
-                          timeout_msg="Error: Codex reply timed out",
-                          progress_token=progress_token,
-                          progress_label="Codex reply")
+        result, result_thread_id, _ = _wait_proc(
+            proc,
+            request_id=request_id,
+            timeout_msg="Error: Codex reply timed out",
+            progress_token=progress_token,
+            progress_label="Codex reply",
+            command=" ".join(cmd),
+        )
+        return result, result_thread_id
     except Exception as exc:
         return f"Error calling Codex reply: {exc}", None
     finally:
@@ -1124,6 +1432,8 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
       - meta (if status is running/completed/failed)
       - elapsed_seconds (if status is running/completed/failed)
       - exit_code (if failed, may be None)
+      - exit_code_lost (whether the process exit code was unavailable)
+      - status_inferred (whether the verdict used the compatibility fallback)
       - error (if error/not_found)
 
     On first detection of process death, persists final state to metadata
@@ -1146,6 +1456,11 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
     # Already finalized in a previous call
     if meta.get("status") in ("completed", "failed", "cancelled"):
         completed_at = meta.get("completed_at", started_at)
+        status_inferred = (
+            bool(meta["status_inferred"])
+            if "status_inferred" in meta
+            else bool(meta.get("exit_code_lost"))
+        )
         return {
             "status": meta["status"],
             "task_id": task_id,
@@ -1153,6 +1468,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
             "elapsed_seconds": int(completed_at - started_at),
             "exit_code": meta.get("exit_code"),
             "exit_code_lost": bool(meta.get("exit_code_lost")),
+            "status_inferred": status_inferred,
         }
 
     pid = meta.get("pid")
@@ -1178,6 +1494,11 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
             return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
         if meta.get("status") in ("completed", "failed", "cancelled"):
             completed_at = meta.get("completed_at", started_at)
+            status_inferred = (
+                bool(meta["status_inferred"])
+                if "status_inferred" in meta
+                else bool(meta.get("exit_code_lost"))
+            )
             return {
                 "status": meta["status"],
                 "task_id": task_id,
@@ -1185,6 +1506,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
                 "elapsed_seconds": int(completed_at - started_at),
                 "exit_code": meta.get("exit_code"),
                 "exit_code_lost": bool(meta.get("exit_code_lost")),
+                "status_inferred": status_inferred,
             }
 
         # Determine exit code.
@@ -1232,29 +1554,19 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         # timestamp, causing premature cleanup.
         completed_at = time.time()
 
-        # exit_code None means we lost it to a reaping race. Non-empty stderr
-        # is NOT evidence of failure: codex writes progress, warnings and
-        # sandbox notices there on perfectly healthy runs, so the old check
-        # reported finished work as failed and callers acted on that verdict
-        # (observed: a task marked failed that had written several modules
-        # with 80 tests passing). A completed agent_message in the JSONL is
-        # real evidence the run reached the end -- prefer it, and fall back to
-        # the stderr heuristic only when there is no such message at all.
+        # Unambiguous terminal JSONL is authoritative even if the exit code was
+        # lost: turn.completed wins over earlier retryable errors, while
+        # turn.failed wins over an earlier partial agent message. Missing or
+        # contradictory terminal events defer to the observed exit code. Only
+        # when that code was also lost do we use the 1.10.0 compatibility
+        # fallback, whose stderr branch is explicitly marked as inferred.
         exit_code_lost = exit_code is None
-        if exit_code is None:
-            final_text, _ = _extract_from_jsonl(
-                _safe_read(TASK_DIR / f"{task_id}.stdout")
-            )
-            if final_text:
-                final_status = "completed"
-            elif _safe_read(TASK_DIR / f"{task_id}.stderr").strip():
-                final_status = "failed"
-            else:
-                final_status = "completed"
-        elif exit_code != 0:
-            final_status = "failed"
-        else:
-            final_status = "completed"
+        stdout_text = _safe_read(TASK_DIR / f"{task_id}.stdout")
+        stderr_text = _safe_read(TASK_DIR / f"{task_id}.stderr")
+        analysis = _analyze_jsonl(stdout_text)
+        final_status, status_inferred = _decide_run_status(
+            exit_code, analysis, stderr_text
+        )
 
         # Persist final state to metadata
         meta["status"] = final_status
@@ -1262,8 +1574,8 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         if exit_code is not None:
             meta["exit_code"] = exit_code
         if exit_code_lost:
-            # Verdict was inferred from output, not observed from a wait status.
             meta["exit_code_lost"] = True
+        meta["status_inferred"] = status_inferred
         try:
             meta_file.write_text(json.dumps(meta, indent=2))
         except Exception:
@@ -1280,6 +1592,7 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         "elapsed_seconds": int(completed_at - started_at),
         "exit_code": exit_code,
         "exit_code_lost": exit_code_lost,
+        "status_inferred": status_inferred,
     }
 
 
@@ -1313,7 +1626,8 @@ def _check_task(task_id: str) -> Dict[str, Any]:
     # completed or failed
     stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
     stderr = _safe_read(TASK_DIR / f"{task_id}.stderr")
-    result, thread_id = _extract_result(stdout, stderr)
+    analysis = _analyze_jsonl(stdout)
+    result, thread_id = _extract_result(stdout, stderr, analysis=analysis)
     meta = state.get("meta", {})
 
     resp = {
@@ -1322,6 +1636,10 @@ def _check_task(task_id: str) -> Dict[str, Any]:
         "result": result,
         "elapsed_seconds": state["elapsed_seconds"],
     }
+    if status in ("completed", "failed"):
+        resp["exit_code"] = state.get("exit_code")
+        resp["exit_code_lost"] = bool(state.get("exit_code_lost"))
+        resp["status_inferred"] = bool(state.get("status_inferred"))
     if meta.get("worktree_path"):
         resp["worktree_path"] = meta["worktree_path"]
     if meta.get("worktree_branch"):
@@ -1329,10 +1647,24 @@ def _check_task(task_id: str) -> Dict[str, Any]:
     if thread_id:
         resp["thread_id"] = thread_id
     if status == "failed":
-        resp["exit_code"] = state.get("exit_code")
-        resp["exit_code_lost"] = bool(state.get("exit_code_lost"))
-        if stderr and stderr.strip():
-            resp["stderr"] = stderr.strip()[-500:]
+        failure = _build_failure_info(
+            stdout, stderr, command=meta.get("command"), analysis=analysis
+        )
+        resp["failure_cause"] = failure["cause"]
+        resp["model"] = failure.get("model")
+        resp["failure_category"] = failure["category"]
+        resp["retryable"] = failure["retryable"]
+        resp["failure_action"] = failure["action"]
+        resp["failure_detail"] = _format_failure_info(failure)
+        if failure.get("stdout_diagnostics"):
+            resp["stdout_diagnostics"] = failure["stdout_diagnostics"]
+        if failure.get("stderr_diagnostics"):
+            resp["stderr_diagnostics"] = failure["stderr_diagnostics"]
+        # Work the agent had already emitted before the turn failed. Never the
+        # "result" -- but the caller needs it, because it is the difference
+        # between a clean retry and one that lands on a half-edited tree.
+        if analysis.get("last_assistant_text"):
+            resp["partial_output"] = analysis["last_assistant_text"]
     return resp
 
 
@@ -1504,7 +1836,11 @@ TOOLS = [
             "though the underlying `codex exec` keeps running to completion. "
             "Use codex_async + codex_wait for anything that might run longer "
             "than a couple of minutes, and whenever you want more than one "
-            "session at a time."
+            "session at a time. Terminal failures report the model actually "
+            "used, the structured provider/CLI cause, a category, and "
+            "informational retryability. Stderr is labeled secondary "
+            "diagnostics and never replaces the cause; this wrapper does not "
+            "retry a turn."
         ),
         "inputSchema": {
             "type": "object",
@@ -1544,7 +1880,10 @@ TOOLS = [
             "thread/session ID and a follow-up prompt. Uses `codex exec resume` "
             "under the hood. Best for short follow-ups; for anything long-running "
             "use codex_async(threadId=..., prompt=...) instead, which returns a "
-            "task_id that survives a client idle timeout."
+            "task_id that survives a client idle timeout. Terminal failures "
+            "report the configured model, structured cause, category, and "
+            "informational retryability; stderr is secondary diagnostics only "
+            "and the wrapper does not retry the turn."
         ),
         "inputSchema": {
             "type": "object",
@@ -1569,11 +1908,16 @@ TOOLS = [
             "Works on both running and completed tasks. This is a read-only "
             "peek: it collects nothing and does not keep a task attached to "
             "your session -- only codex_wait does that, so never end a turn on "
-            "a status check expecting to be called back. A FAILED verdict here "
-            "is not always authoritative: when the exit code is lost to a "
-            "reaping race the status is inferred from output alone, and the "
+            "a status check expecting to be called back. Terminal "
+            "turn.completed/turn.failed events take precedence; top-level "
+            "error events and error items are treated as non-terminal diagnostics. "
+            "A terminal failure includes its structured cause, actual model, "
+            "category, and informational retryability. A FAILED verdict here "
+            "is not always authoritative: when no unambiguous terminal event "
+            "or exit code is available, status is inferred from output and the "
             "response says so explicitly. Verify before treating a reported "
-            "failure as proof the work did not land."
+            "failure as proof the work did not land. Inferred completion "
+            "verdicts are labeled too."
         ),
         "inputSchema": {
             "type": "object",
@@ -1604,7 +1948,11 @@ TOOLS = [
             "responsible for remembering to come back. Already-finished tasks "
             "return instantly regardless. "
             "If the wait itself times out the task is NOT killed; call "
-            "codex_wait again with the same task_ids to resume waiting."
+            "codex_wait again with the same task_ids to resume waiting. Failed "
+            "tasks return the model actually used, the structured cause, a "
+            "category, and informational retryability. Stderr is labeled "
+            "secondary diagnostics and never replaces the cause. The wrapper "
+            "does not retry a turn."
         ),
         "inputSchema": {
             "type": "object",
@@ -1632,7 +1980,8 @@ TOOLS = [
         "description": (
             "Kill a running async Codex task. The process is terminated and "
             "the task is marked as cancelled. Any worktree and partial output "
-            "are preserved for inspection."
+            "are preserved for inspection. If the task had already failed, "
+            "the response includes its structured failure details."
         ),
         "inputSchema": {
             "type": "object",
@@ -1667,7 +2016,10 @@ RESOURCES = [
     {
         "uri": "codex-swarm:///tasks",
         "name": "Active Tasks",
-        "description": "List of all known async tasks and their current state.",
+        "description": (
+            "List of all known async tasks and their current state. Failed "
+            "entries include model, structured cause, category, and retryability."
+        ),
         "mimeType": "application/json",
     },
 ]
@@ -1685,6 +2037,13 @@ def _read_resource(uri: str) -> Optional[str]:
             "task_max_age_seconds": _TASK_MAX_AGE,
             "log_file": LOG_FILE,
             "log_level": LOG_LEVEL,
+            "failure_reporting": {
+                "terminal_events": ["turn.completed", "turn.failed"],
+                "top_level_error_is_terminal": False,
+                "error_item_is_terminal": False,
+                "stderr_role": "secondary diagnostics only",
+                "wrapper_retries": False,
+            },
         }, indent=2)
 
     if uri == "codex-swarm:///config":
@@ -1705,10 +2064,31 @@ def _read_resource(uri: str) -> Optional[str]:
                     "status": state.get("status"),
                     "elapsed_seconds": state.get("elapsed_seconds"),
                 }
+                if state.get("status") in ("completed", "failed"):
+                    entry.update({
+                        "exit_code": state.get("exit_code"),
+                        "exit_code_lost": bool(state.get("exit_code_lost")),
+                        "status_inferred": bool(state.get("status_inferred")),
+                    })
                 for key in ("worktree_path", "worktree_branch", "thread_id"):
                     val = meta.get(key)
                     if val:
                         entry[key] = val
+                if state.get("status") == "failed":
+                    stdout = _safe_read(TASK_DIR / f"{task_id}.stdout")
+                    stderr = _safe_read(TASK_DIR / f"{task_id}.stderr")
+                    failure = _build_failure_info(
+                        stdout, stderr, command=meta.get("command")
+                    )
+                    entry.update({
+                        "model": failure.get("model"),
+                        "failure_cause": failure["cause"],
+                        "failure_category": failure["category"],
+                        "retryable": failure["retryable"],
+                        "failure_action": failure["action"],
+                    })
+                    if failure.get("stderr_diagnostics"):
+                        entry["stderr_diagnostics"] = failure["stderr_diagnostics"]
                 tasks.append(entry)
             except Exception:
                 continue
@@ -1732,11 +2112,27 @@ def _cancel_task(task_id: str) -> Dict[str, Any]:
         return {"status": "error", "error": f"Bad metadata: {exc}"}
 
     if meta.get("status") in ("completed", "failed", "cancelled"):
-        return {
+        resp: Dict[str, Any] = {
             "status": meta["status"],
             "task_id": task_id,
             "message": f"Task already {meta['status']}",
         }
+        if meta["status"] == "failed":
+            failure = _check_task(task_id)
+            for key in (
+                "exit_code",
+                "exit_code_lost",
+                "status_inferred",
+                "model",
+                "failure_cause",
+                "failure_category",
+                "retryable",
+                "failure_action",
+                "failure_detail",
+            ):
+                if key in failure:
+                    resp[key] = failure[key]
+        return resp
 
     pid = meta.get("pid")
     pid_start_time = meta.get("pid_start_time")
@@ -1985,27 +2381,31 @@ def _handle(request: Dict[str, Any]) -> None:
 
                 elapsed = state["elapsed_seconds"]
                 stdout_path = TASK_DIR / f"{tid}.stdout"
+                stderr_path = TASK_DIR / f"{tid}.stderr"
+                stdout_text = _safe_read(stdout_path)
                 jsonl_status = _parse_jsonl_status(stdout_path)
 
                 if status == "running":
                     lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
                 elif status == "failed":
-                    exit_code = state.get("exit_code", "?")
+                    exit_code = state.get("exit_code")
+                    if exit_code is None:
+                        exit_code = "?"
                     lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
-                    if state.get("exit_code_lost"):
+                    if state.get("status_inferred"):
                         lines.append(_UNVERIFIED_FAILURE_HINT)
                 elif status == "cancelled":
                     lines = [f"=== Task {tid} (CANCELLED after {elapsed}s) ==="]
                 else:
                     lines = [f"=== Task {tid} (COMPLETED in {elapsed}s) ==="]
+                    if state.get("status_inferred"):
+                        lines.append(_UNVERIFIED_COMPLETION_HINT)
 
                 # Surface thread_id from meta or stdout
                 meta = state.get("meta", {})
                 tid_thread = meta.get("thread_id")
-                if not tid_thread:
-                    stdout_text = _safe_read(stdout_path)
-                    if stdout_text:
-                        _, tid_thread = _extract_from_jsonl(stdout_text)
+                if not tid_thread and stdout_text:
+                    _, tid_thread = _extract_from_jsonl(stdout_text)
                 if tid_thread:
                     lines.append(f"Thread ID: {tid_thread}")
                 if meta.get("worktree_path"):
@@ -2013,8 +2413,50 @@ def _handle(request: Dict[str, Any]) -> None:
                 if meta.get("worktree_branch"):
                     lines.append(f"Branch: {meta['worktree_branch']}")
 
-                lines.append(f"Phase: {jsonl_status['phase']}")
+                display_phase = (
+                    status
+                    if status in ("completed", "failed", "cancelled")
+                    else jsonl_status["phase"]
+                )
+                lines.append(f"Phase: {display_phase}")
                 lines.append(f"Tools called: {jsonl_status['tools_called']}")
+
+                if status == "failed":
+                    failure = _build_failure_info(
+                        stdout_text,
+                        _safe_read(stderr_path),
+                        command=meta.get("command"),
+                    )
+                    lines.extend(
+                        _format_failure_info(failure).splitlines()
+                    )
+                elif status == "running" and jsonl_status["last_error"]:
+                    observed = _classify_failure(jsonl_status["last_error"])
+                    retryable = observed.get("retryable")
+                    retryable_text = (
+                        "yes"
+                        if retryable is True
+                        else "no"
+                        if retryable is False
+                        else "unknown"
+                    )
+                    lines.append(
+                        "Error observed (non-terminal; process still running): "
+                        f"{jsonl_status['last_error'][:300]}"
+                    )
+                    lines.append(f"Category: {observed['category']}")
+                    lines.append(
+                        "Retryable: "
+                        f"{retryable_text} (informational only; the wrapper did not retry)"
+                    )
+
+                if jsonl_status["last_warning"]:
+                    lines.append(f"Warning: {jsonl_status['last_warning'][:300]}")
+
+                if jsonl_status["terminal_conflict"]:
+                    lines.append(
+                        "Terminal signals conflicted; lifecycle state used the process exit code."
+                    )
 
                 if jsonl_status["last_tool"]:
                     tool_info = jsonl_status["last_tool"]
@@ -2028,8 +2470,13 @@ def _handle(request: Dict[str, Any]) -> None:
                     )
 
                 if jsonl_status["last_assistant_text"]:
+                    output_label = (
+                        "Partial output (before failure)"
+                        if status == "failed"
+                        else "Output"
+                    )
                     lines.append(
-                        f"Output: {jsonl_status['last_assistant_text'][:300]}"
+                        f"{output_label}: {jsonl_status['last_assistant_text'][:300]}"
                     )
 
                 parts.append("\n".join(lines))
@@ -2094,9 +2541,14 @@ def _handle(request: Dict[str, Any]) -> None:
                         header += f"\nWorktree: {info['worktree_path']}"
                     if info.get("worktree_branch"):
                         header += f"\nBranch: {info['worktree_branch']}"
-                    parts.append(f"{header}\n{info['result']}")
+                    detail = info["result"]
+                    if info.get("status_inferred"):
+                        detail = f"{_UNVERIFIED_COMPLETION_HINT}\n\n{detail}"
+                    parts.append(f"{header}\n{detail}")
                 elif info["status"] == "failed":
-                    exit_code = info.get("exit_code", "?")
+                    exit_code = info.get("exit_code")
+                    if exit_code is None:
+                        exit_code = "?"
                     header = (
                         f"=== Task {tid} (FAILED in "
                         f"{info['elapsed_seconds']}s, exit {exit_code}) ==="
@@ -2105,8 +2557,16 @@ def _handle(request: Dict[str, Any]) -> None:
                         header += f"\nWorktree: {info['worktree_path']}"
                     if info.get("worktree_branch"):
                         header += f"\nBranch: {info['worktree_branch']}"
-                    detail = info.get("stderr") or info.get("result", "No output")
-                    if info.get("exit_code_lost"):
+                    detail = info.get("failure_detail") or (
+                        "Model: unknown\n"
+                        f"Cause: {info.get('failure_cause', 'Unknown Codex failure')}"
+                    )
+                    if info.get("partial_output"):
+                        detail += (
+                            "\n\nPartial output (before failure): "
+                            f"{info['partial_output'][:300]}"
+                        )
+                    if info.get("status_inferred"):
                         detail = f"{_UNVERIFIED_FAILURE_HINT}\n\n{detail}"
                     parts.append(f"{header}\n{detail}")
                 elif info["status"] == "cancelled":
@@ -2166,6 +2626,8 @@ def _handle(request: Dict[str, Any]) -> None:
                 lines.append(f"Worktree preserved: {result['worktree_path']}")
             if result.get("worktree_branch"):
                 lines.append(f"Branch preserved: {result['worktree_branch']}")
+            if result.get("failure_detail"):
+                lines.extend(["", result["failure_detail"]])
             _send({
                 "jsonrpc": "2.0",
                 "id": rid,
