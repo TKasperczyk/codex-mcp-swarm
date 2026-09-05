@@ -111,7 +111,7 @@ if os.path.realpath(m.TASK_DIR) != os.path.realpath(expected_task_dir):
 
 MADE = []
 DEAD_PID, BAD_START = os.getpid(), 1.0
-DEFAULT_COMMAND = "codex exec --json -c model=gpt-5.6-sol prompt"
+DEFAULT_COMMAND = "codex exec --json -c model=gpt-6-astra prompt"
 
 
 def make_task(task_id, stdout, stderr="", exit_code=None, command=DEFAULT_COMMAND):
@@ -179,7 +179,7 @@ try:
     )
     output = call("codex_wait", {"task_ids": ["11000001"], "timeout": 1})
     check("structured capacity message is the cause", f"Cause: {CAPACITY}" in output)
-    check("model is parsed from -c model=", "Model: gpt-5.6-sol" in output)
+    check("model is parsed from -c model=", "Model: gpt-6-astra" in output)
     check("capacity is classified retryable", "Category: provider_capacity" in output and "Retryable: yes" in output)
     check("stderr is explicitly secondary", "Diagnostics (stderr tail; not the failure cause):" in output)
     check("cause precedes stderr diagnostics", output.index("Cause:") < output.index("Diagnostics (stderr"))
@@ -198,12 +198,12 @@ try:
     check("authentication failure is not retryable", "Category: authentication" in output and "Retryable: no" in output)
     check("no raw JSONL dump is used as fallback", '"type": "thread.started"' not in output)
     status_output = call("codex_status", {"task_ids": ["11000002"]})
-    check("status uses the same cause and model", f"Cause: {REVOKED}" in status_output and "Model: gpt-5.6-sol" in status_output)
+    check("status uses the same cause and model", f"Cause: {REVOKED}" in status_output and "Model: gpt-6-astra" in status_output)
     cancel_output = call("codex_cancel", {"task_id": "11000002"})
     check("cancel on an already-failed task preserves the cause", f"Cause: {REVOKED}" in cancel_output)
     task_resource = json.loads(m._read_resource("codex-swarm:///tasks"))
     resource_entry = next(item for item in task_resource if item["task_id"] == "11000002")
-    check("task resource exposes structured failure fields", resource_entry["failure_cause"] == REVOKED and resource_entry["model"] == "gpt-5.6-sol")
+    check("task resource exposes structured failure fields", resource_entry["failure_cause"] == REVOKED and resource_entry["model"] == "gpt-6-astra")
 
     # -- 3. turn.failed resolves an exit-code-lost run without inference ----
     print("\n[3] exit code lost after turn.failed")
@@ -343,11 +343,11 @@ try:
     real_popen = m.subprocess.Popen
     m.subprocess.Popen = fake_popen_factory(sync_stdout, RUST_NOISE, 1, calls)
     try:
-        output = call("codex", {"prompt": "test", "model": "gpt-5.6-sol"})
+        output = call("codex", {"prompt": "test", "model": "gpt-6-astra"})
     finally:
         m.subprocess.Popen = real_popen
     check("sync failure reports clean structured cause", f"Cause: {CAPACITY}" in output)
-    check("sync failure reports actual model", "Model: gpt-5.6-sol" in output)
+    check("sync failure reports actual model", "Model: gpt-6-astra" in output)
     check("sync stderr is secondary diagnostics", "Diagnostics (stderr tail; not the failure cause):" in output)
     check("sync wrapper launches no retry", len(calls) == 1, f"{len(calls)} launches")
     check("sync command requests public JSONL", bool(calls) and "--json" in calls[0])
@@ -359,7 +359,7 @@ try:
     saved_config = dict(m.SERVER_CONFIG)
     real_popen = m.subprocess.Popen
     m.SERVER_CONFIG.clear()
-    m.SERVER_CONFIG["model"] = "gpt-5.6-sol"
+    m.SERVER_CONFIG["model"] = "gpt-6-astra"
     m.subprocess.Popen = fake_popen_factory(reply_stdout, RUST_NOISE, 1, calls)
     try:
         output = call("codex_reply", {"threadId": THREAD_ID, "prompt": "continue"})
@@ -368,7 +368,7 @@ try:
         m.SERVER_CONFIG.clear()
         m.SERVER_CONFIG.update(saved_config)
     check("reply failure reports clean structured cause", f"Cause: {REVOKED}" in output)
-    check("reply failure reports configured model", "Model: gpt-5.6-sol" in output)
+    check("reply failure reports configured model", "Model: gpt-6-astra" in output)
     check("reply failure says authentication is not retryable", "Category: authentication" in output and "Retryable: no" in output)
     check("reply wrapper launches no retry", len(calls) == 1, f"{len(calls)} launches")
     expected_prefix = ["codex", "exec", "resume", "--json"]

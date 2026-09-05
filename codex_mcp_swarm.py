@@ -42,7 +42,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.11.0"
+__version__ = "1.11.1"
 
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
@@ -1800,7 +1800,7 @@ _CODEX_PROPERTIES = {
     },
     "model": {
         "type": "string",
-        "description": "Optional override for the model name (e.g. 'gpt-5.4').",
+        "description": "Optional override for the model name (e.g. 'gpt-6-astra').",
     },
     "profile": {
         "type": "string",

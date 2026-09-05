@@ -31,7 +31,7 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 
 ```bash
 claude mcp add codex-swarm -- uvx --upgrade codex-mcp-swarm \
-  -c model=gpt-5.4 \
+  -c model=gpt-6-astra \
   -c approval_policy=never \
   -c sandbox_mode=danger-full-access \
   --skip-git-repo-check
@@ -52,7 +52,7 @@ That's it. No clone, no setup. `uvx` downloads and runs it directly from PyPI. T
       "args": [
         "--upgrade",
         "codex-mcp-swarm",
-        "-c", "model=gpt-5.4",
+        "-c", "model=gpt-6-astra",
         "-c", "approval_policy=never",
         "-c", "sandbox_mode=danger-full-access",
         "--skip-git-repo-check"
