@@ -371,8 +371,9 @@ try:
     check("reply failure reports configured model", "Model: gpt-6-astra" in output)
     check("reply failure says authentication is not retryable", "Category: authentication" in output and "Retryable: no" in output)
     check("reply wrapper launches no retry", len(calls) == 1, f"{len(calls)} launches")
-    expected_prefix = ["codex", "exec", "resume", "--json"]
-    check("reply requests JSONL in the accepted position", bool(calls) and calls[0][:4] == expected_prefix, repr(calls[0][:4] if calls else []))
+    expected_prefix = m._exec_argv(["codex", "exec", "resume", "--json"])
+    n = len(expected_prefix)
+    check("reply requests JSONL in the accepted position", bool(calls) and calls[0][:n] == expected_prefix, repr(calls[0][:n] if calls else []))
 
 finally:
     m._ASYNC_PIDS.pop(DEAD_PID, None)
