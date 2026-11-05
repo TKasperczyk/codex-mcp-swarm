@@ -224,6 +224,9 @@ The server exposes read-only resources for discoverability:
 | `CODEX_SWARM_WORKTREE_DIR` | `/tmp/codex-swarm-worktrees` | Worktree storage directory |
 | `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds before completed task artifacts (and worktrees) are cleaned up |
 | `CODEX_SWARM_MIN_WAIT` | `150` | Floor in seconds for `codex_wait`. Keeps the call above the client's 2-minute auto-backgrounding threshold so completion re-invokes the session. Already-finished tasks ignore it |
+| `CODEX_SWARM_CODEX_BIN` | _(auto)_ | Windows only: path to `codex.exe` or to the npm package's `codex.js`, overriding the PATH lookup |
+
+On Windows the `/tmp/...` defaults become the per-user temp directory (`%TEMP%`).
 
 ## Requirements
 
@@ -231,6 +234,18 @@ The server exposes read-only resources for discoverability:
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated
 - No pip dependencies (stdlib only)
 - Works on Linux and macOS (Linux gets extra PID reuse protection and zombie detection via `/proc`)
+- Works on Windows (native, no WSL): PID reuse protection via process creation time, cancellation kills the whole process tree
+
+### Windows notes
+
+- An npm-installed Codex is a `codex.cmd` shim. The server resolves it to `node .../@openai/codex/bin/codex.js` and never runs Codex through `cmd.exe`, which would cut multi-line prompts at the first newline and interpret `& | < > ^ %`. If Codex lives elsewhere, set `CODEX_SWARM_CODEX_BIN`.
+- Children are started without a console window and in their own process group. Async tasks are not tied to the server process, but if the MCP client runs the server inside a kill-on-close job object, they end with it.
+- The Windows command line is limited to 32,767 characters, which caps prompt plus instructions per call.
+- Codex itself needs a Windows sandbox backend. Without one (`codex doctor` shows `sandbox backend disabled`), `read-only`/`workspace-write` calls with `approval-policy: never` reject every shell command as "blocked by policy". Set it in `~/.codex/config.toml` (`unelevated` needs no admin rights):
+  ```toml
+  [windows]
+  sandbox = "unelevated"
+  ```
 
 ## Credits
 

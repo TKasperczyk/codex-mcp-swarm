@@ -127,7 +127,7 @@ try:
     print("\n[5] codex_wait output")
     inferred = call("codex_wait", {"task_ids": ["aaaa0002"], "timeout": 1})
     check("inferred failure carries the verify hint", "inferred, not observed" in inferred)
-    check("hint names a concrete check", "pgrep -af 'codex exec'" in inferred)
+    check("hint names a concrete check", m._PROCESS_CHECK_CMD.strip("`") in inferred)
     genuine = call("codex_wait", {"task_ids": ["aaaa0003"], "timeout": 1})
     check("genuine failure has no hint", "inferred, not observed" not in genuine)
 

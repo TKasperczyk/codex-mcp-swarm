@@ -38,16 +38,25 @@ import traceback
 import argparse
 import re
 import shlex
+import shutil
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 __version__ = "1.11.1"
 
+_IS_WINDOWS = sys.platform == "win32"
+
+# /tmp does not exist on Windows; use the per-user temp dir there.
+_DEFAULT_TMP = tempfile.gettempdir() if _IS_WINDOWS else "/tmp"
+
 # ---------------------------------------------------------------------------
 # Logging (configurable via env vars)
 # ---------------------------------------------------------------------------
-LOG_FILE = os.environ.get("CODEX_SWARM_LOG", "/tmp/codex_mcp_swarm.log")
+LOG_FILE = os.environ.get(
+    "CODEX_SWARM_LOG", os.path.join(_DEFAULT_TMP, "codex_mcp_swarm.log")
+)
 LOG_LEVEL = os.environ.get("CODEX_SWARM_LOG_LEVEL", "WARNING").upper()
 
 logging.basicConfig(
@@ -60,13 +69,194 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 # Task storage
 # ---------------------------------------------------------------------------
-TASK_DIR = Path(os.environ.get("CODEX_SWARM_TASK_DIR", "/tmp/codex_swarm_tasks"))
+TASK_DIR = Path(
+    os.environ.get("CODEX_SWARM_TASK_DIR", os.path.join(_DEFAULT_TMP, "codex_swarm_tasks"))
+)
 TASK_DIR.mkdir(exist_ok=True, mode=0o700)
 
 WORKTREE_BASE_DIR = Path(
-    os.environ.get("CODEX_SWARM_WORKTREE_DIR", "/tmp/codex-swarm-worktrees")
+    os.environ.get(
+        "CODEX_SWARM_WORKTREE_DIR", os.path.join(_DEFAULT_TMP, "codex-swarm-worktrees")
+    )
 )
 WORKTREE_BASE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# ---------------------------------------------------------------------------
+# Platform layer (Windows)
+# ---------------------------------------------------------------------------
+# Everything POSIX-specific stays inline where it always was; Windows gets its
+# own branch through these helpers so the Linux/macOS path is unchanged.
+
+# Subprocess text decoding. Codex and git emit UTF-8; Windows would otherwise
+# decode with the ANSI code page and mangle or reject non-ASCII output.
+_TEXT_KW: Dict[str, Any] = (
+    {"text": True, "encoding": "utf-8", "errors": "replace"}
+    if _IS_WINDOWS
+    else {"text": True}
+)
+
+if _IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetProcessTimes.restype = wintypes.BOOL
+    _kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+    _ERROR_ACCESS_DENIED = 5
+
+    # No console window per child (the server itself usually has none, so
+    # each console child would pop one up) and its own process group so a
+    # console Ctrl+C aimed at the server does not reach detached tasks.
+    _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
+
+def _win_open_process(pid: int) -> Tuple[Optional[int], bool]:
+    """Return (handle, access_denied). handle is None if the PID is gone."""
+    handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        return handle, False
+    return None, ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+
+
+def _win_is_running(pid: int) -> bool:
+    handle, denied = _win_open_process(pid)
+    if handle is None:
+        return denied  # exists but not ours to inspect -- same as POSIX EPERM
+    try:
+        code = wintypes.DWORD()
+        if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == _STILL_ACTIVE
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _win_start_time(pid: int) -> Optional[float]:
+    handle, _ = _win_open_process(pid)
+    if handle is None:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not _kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return None
+        created = times[0]
+        return ((created.dwHighDateTime << 32) | created.dwLowDateTime) / 1e7
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _win_kill_tree(pid: int) -> None:
+    """Kill a process and every descendant.
+
+    Codex on Windows runs as node -> codex.exe -> tool shells, and killing
+    only the top process orphans the rest (which also keep our stdout pipes
+    open, so communicate() would never return).
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=30,
+        )
+    except Exception as exc:
+        logging.warning("taskkill failed for PID %d: %s", pid, exc)
+
+
+_codex_launcher_cache: Optional[List[str]] = None
+
+
+def _codex_launcher() -> List[str]:
+    """argv prefix that runs the Codex CLI.
+
+    POSIX: plain ``codex``. Windows: npm installs ``codex.cmd``, and running a
+    batch file routes every argument through cmd.exe, which truncates the
+    prompt at the first newline and interprets ``& | < > ^ %``. So resolve the
+    shim to ``node codex.js`` (or a native codex.exe) and never touch cmd.exe.
+    ``CODEX_SWARM_CODEX_BIN`` overrides the lookup with an .exe or .js path.
+    """
+    global _codex_launcher_cache
+    if not _IS_WINDOWS:
+        return ["codex"]
+    if _codex_launcher_cache is not None:
+        return _codex_launcher_cache
+
+    def node_for(js: str, near: Optional[str] = None) -> List[str]:
+        local_node = os.path.join(near, "node.exe") if near else None
+        node = local_node if local_node and os.path.isfile(local_node) else shutil.which("node")
+        if not node:
+            raise RuntimeError(f"node.exe not found (needed to run {js})")
+        return [node, js]
+
+    override = os.environ.get("CODEX_SWARM_CODEX_BIN")
+    if override:
+        launcher = node_for(override) if override.lower().endswith(".js") else [override]
+    else:
+        found = shutil.which("codex")
+        if not found:
+            raise RuntimeError("codex not found on PATH (set CODEX_SWARM_CODEX_BIN)")
+        if found.lower().endswith(".exe"):
+            launcher = [found]
+        else:
+            shim_dir = os.path.dirname(found)
+            js = os.path.join(shim_dir, "node_modules", "@openai", "codex", "bin", "codex.js")
+            if not os.path.isfile(js):
+                raise RuntimeError(
+                    f"{found} is a script shim and {js} does not exist; "
+                    "refusing to run Codex through cmd.exe (set CODEX_SWARM_CODEX_BIN)"
+                )
+            launcher = node_for(js, near=shim_dir)
+
+    logging.info("Codex launcher: %s", launcher)
+    _codex_launcher_cache = launcher
+    return launcher
+
+
+def _exec_argv(cmd: List[str]) -> List[str]:
+    """Map a logical ``codex ...`` command to what actually gets executed.
+
+    Commands stay ``["codex", ...]`` everywhere else (logging, metadata,
+    index-based flag insertion); only the spawn sees the resolved launcher.
+    """
+    if cmd and cmd[0] == "codex":
+        return _codex_launcher() + cmd[1:]
+    return cmd
+
+
+def _popen_kw(detach: bool = False) -> Dict[str, Any]:
+    """Platform-specific Popen kwargs for Codex children."""
+    if _IS_WINDOWS:
+        return {"creationflags": _POPEN_FLAGS}
+    return {"start_new_session": True} if detach else {}
+
+
+def _stop_proc(proc: subprocess.Popen) -> None:
+    """Terminate a child, escalating to kill after 5s, and reap it."""
+    if _IS_WINDOWS:
+        _win_kill_tree(proc.pid)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 # ---------------------------------------------------------------------------
 # Protocol negotiation
@@ -136,7 +326,10 @@ def _sigchld_handler(signum, frame):
             logging.warning("SIGCHLD handler error for PID %d: %s", pid, exc)
 
 
-signal.signal(signal.SIGCHLD, _sigchld_handler)
+# Windows has no SIGCHLD and no zombies: Popen.poll() on the kept-alive
+# handle in _ASYNC_PROCS returns the real exit code without any reaping race.
+if hasattr(signal, "SIGCHLD"):
+    signal.signal(signal.SIGCHLD, _sigchld_handler)
 
 # ===================================================================
 # Utility helpers
@@ -170,7 +363,8 @@ def _create_worktree(run_id: str, base_cwd: Optional[str]) -> Tuple[str, str, st
             ["git", "-C", str(effective_cwd), "rev-parse", "--show-toplevel"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **_TEXT_KW,
+            **_popen_kw(),
             check=True,
         )
         repo_root = Path(proc.stdout.strip()).resolve()
@@ -198,7 +392,8 @@ def _create_worktree(run_id: str, base_cwd: Optional[str]) -> Tuple[str, str, st
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **_TEXT_KW,
+            **_popen_kw(),
             check=True,
         )
     except subprocess.CalledProcessError as exc:
@@ -229,7 +424,8 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
             ["git", "-C", str(worktree_input), "rev-parse", "--show-toplevel"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **_TEXT_KW,
+            **_popen_kw(),
             check=True,
         )
         worktree_root = Path(proc.stdout.strip()).resolve()
@@ -242,7 +438,8 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
             ["git", "-C", str(worktree_input), "rev-parse", "--git-common-dir"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **_TEXT_KW,
+            **_popen_kw(),
             check=True,
         )
         common_dir = Path(proc.stdout.strip())
@@ -269,7 +466,8 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                **_TEXT_KW,
+                **_popen_kw(),
                 check=True,
             )
             logging.info("Removed worktree %s", worktree_root)
@@ -295,7 +493,8 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
                 ["git", "-C", str(repo_root), "branch", "-D", branch_name],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                **_TEXT_KW,
+                **_popen_kw(),
                 check=True,
             )
             logging.info("Deleted worktree branch %s", branch_name)
@@ -308,6 +507,8 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
 
 def _get_pid_start_time(pid: int) -> Optional[float]:
     """Get process start time from /proc (Linux). Returns None if unavailable."""
+    if _IS_WINDOWS:
+        return _win_start_time(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         # Field 22 (0-indexed: 21) is starttime in clock ticks
@@ -320,25 +521,31 @@ def _get_pid_start_time(pid: int) -> Optional[float]:
 def _is_alive(pid: Optional[int], expected_start_time: Optional[float] = None) -> bool:
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
+    if _IS_WINDOWS:
+        # os.kill(pid, 0) is not a probe on Windows: any signal other than
+        # CTRL_C/CTRL_BREAK calls TerminateProcess and would kill the task.
+        if not _win_is_running(pid):
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
 
-    # Check for zombie via /proc (Linux)
-    try:
-        stat_path = Path(f"/proc/{pid}/status")
-        if stat_path.exists():
-            for line in stat_path.read_text().splitlines():
-                if line.startswith("State:"):
-                    if "Z" in line:
-                        return False
-    except Exception:
-        pass
+        # Check for zombie via /proc (Linux)
+        try:
+            stat_path = Path(f"/proc/{pid}/status")
+            if stat_path.exists():
+                for line in stat_path.read_text().splitlines():
+                    if line.startswith("State:"):
+                        if "Z" in line:
+                            return False
+        except Exception:
+            pass
 
     # Guard against PID reuse: if we recorded the start time, verify it matches
     if expected_start_time is not None:
@@ -1011,11 +1218,17 @@ _WAIT_MIN_TIMEOUT = int(
 # A wrapper-level "failure" is not proof the Codex run died or that its edits
 # never landed. Both of these are attached to output that callers have
 # historically acted on as if it were a clean failure.
+_PROCESS_CHECK_CMD = (
+    "`tasklist /FI \"IMAGENAME eq codex.exe\"`"
+    if _IS_WINDOWS
+    else "`pgrep -af 'codex exec'`"
+)
+
 _UNVERIFIED_FAILURE_HINT = (
     "NOTE: this verdict is inferred, not observed -- the exit code was lost to "
     "a reaping race, so the status was derived from output alone. Codex may "
     "have finished its work. Verify before reporting failure upstream: run "
-    "`pgrep -af 'codex exec'` to see whether it is still alive, then check "
+    f"{_PROCESS_CHECK_CMD} to see whether it is still alive, then check "
     "file mtimes, the worktree branch, and your own build/tests."
 )
 
@@ -1028,7 +1241,7 @@ _UNVERIFIED_COMPLETION_HINT = (
 _STILL_RUNNING_HINT = (
     "This is NOT a failure. The task was not killed and is still working. Call "
     "codex_wait again with the same task_id to keep waiting, or check "
-    "`pgrep -af 'codex exec'`."
+    f"{_PROCESS_CHECK_CMD}."
 )
 
 # Sync children, so an abandoned or cancelled request does not leave an
@@ -1057,12 +1270,7 @@ def _terminate_sync_proc(request_id: Any) -> bool:
         proc = _SYNC_PROCS.get(request_id)
     if proc is None or proc.poll() is not None:
         return False
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    _stop_proc(proc)
     logging.info("Terminated sync child pid=%s for request id=%s", proc.pid, request_id)
     return True
 
@@ -1074,7 +1282,10 @@ def _terminate_all_sync_procs() -> None:
     for request_id, proc in items:
         if proc.poll() is None:
             logging.info("Shutdown: killing sync child pid=%s (request %s)", proc.pid, request_id)
-            proc.kill()
+            if _IS_WINDOWS:
+                _win_kill_tree(proc.pid)
+            else:
+                proc.kill()
 
 
 def _send_progress(progress_token: Any, elapsed: float, label: str) -> None:
@@ -1118,12 +1329,7 @@ def _wait_proc(
         if deadline is not None:
             remaining = deadline - time.time()
             if remaining <= 0:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _stop_proc(proc)
                 return timeout_msg, None, True
         wait_time = min(_POLL_INTERVAL, remaining) if remaining is not None else _POLL_INTERVAL
         try:
@@ -1144,12 +1350,7 @@ def _wait_proc(
             return result, thread_id, False
         except subprocess.TimeoutExpired:
             if request_id is not None and _is_cancelled(request_id):
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _stop_proc(proc)
                 return "Cancelled by client", None, True
             now = time.time()
             if now - last_progress >= _PROGRESS_INTERVAL:
@@ -1195,12 +1396,13 @@ def _run_sync(
         cmd = _with_json_flag(cmd)
         logging.info("Sync exec: %s", " ".join(cmd))
         proc = subprocess.Popen(
-            cmd,
+            _exec_argv(cmd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=cwd,
+            **_TEXT_KW,
+            **_popen_kw(),
         )
         _register_sync_proc(request_id, proc)
         result, thread_id, failed = _wait_proc(
@@ -1260,11 +1462,12 @@ def _run_reply_sync(
     proc = None
     try:
         proc = subprocess.Popen(
-            cmd,
+            _exec_argv(cmd),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **_TEXT_KW,
+            **_popen_kw(),
         )
         _register_sync_proc(request_id, proc)
         result, result_thread_id, _ = _wait_proc(
@@ -1375,13 +1578,13 @@ def _start_async(params: dict) -> Dict[str, Optional[str]]:
 
         with open(stdout_f, "w") as out, open(stderr_f, "w") as err:
             proc = subprocess.Popen(
-                cmd,
+                _exec_argv(cmd),
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
-                text=True,
                 cwd=cwd,
-                start_new_session=True,
+                **_TEXT_KW,
+                **_popen_kw(detach=True),
             )
     except Exception:
         # Clean up worktree if task launch fails after creation
@@ -2137,7 +2340,12 @@ def _cancel_task(task_id: str) -> Dict[str, Any]:
     pid = meta.get("pid")
     pid_start_time = meta.get("pid_start_time")
 
-    if pid and _is_alive(pid, expected_start_time=pid_start_time):
+    if pid and _IS_WINDOWS and _is_alive(pid, expected_start_time=pid_start_time):
+        # No SIGTERM/SIGKILL on Windows, and os.kill would only reach the node
+        # launcher; take down the whole tree instead.
+        _win_kill_tree(pid)
+        logging.info("Killed process tree of PID %d (task %s)", pid, task_id)
+    elif pid and _is_alive(pid, expected_start_time=pid_start_time):
         # Terminate the process
         try:
             os.kill(pid, signal.SIGTERM)
@@ -2716,6 +2924,11 @@ def _handle_threaded(request: Dict[str, Any]) -> None:
 
 def main() -> None:
     _parse_args()
+    if _IS_WINDOWS:
+        # MCP stdio is UTF-8 with \n framing; Windows pipes default to the ANSI
+        # code page and print() would emit \r\n.
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     logging.info(
         "Server starting -- defaults=%s flags=%s", SERVER_CONFIG, SERVER_FLAGS
     )
