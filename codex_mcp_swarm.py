@@ -44,7 +44,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.11.1"
+__version__ = "1.12.0"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -108,6 +108,8 @@ if _IS_WINDOWS:
     _kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     _kernel32.CloseHandle.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.GetSystemDirectoryW.restype = wintypes.UINT
+    _kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
 
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _STILL_ACTIVE = 259
@@ -154,16 +156,28 @@ def _win_start_time(pid: int) -> Optional[float]:
         _kernel32.CloseHandle(handle)
 
 
-def _win_kill_tree(pid: int) -> None:
-    """Kill a process and every descendant.
+def _win_system32(exe: str) -> str:
+    """Absolute path to a System32 binary.
+
+    A bare name would go through CreateProcess's search order, which checks
+    the server's current directory (often a repository) before System32.
+    """
+    buf = ctypes.create_unicode_buffer(260)
+    if not _kernel32.GetSystemDirectoryW(buf, len(buf)):
+        raise OSError(ctypes.get_last_error(), "GetSystemDirectoryW failed")
+    return os.path.join(buf.value, exe)
+
+
+def _win_kill_tree(pid: int) -> bool:
+    """Kill a process and every descendant. Returns False if any survived.
 
     Codex on Windows runs as node -> codex.exe -> tool shells, and killing
     only the top process orphans the rest (which also keep our stdout pipes
     open, so communicate() would never return).
     """
     try:
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(pid)],
+        result = subprocess.run(
+            [_win_system32("taskkill.exe"), "/T", "/F", "/PID", str(pid)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -172,6 +186,12 @@ def _win_kill_tree(pid: int) -> None:
         )
     except Exception as exc:
         logging.warning("taskkill failed for PID %d: %s", pid, exc)
+        return False
+    # taskkill exits non-zero when any process in the tree could not be
+    # killed (e.g. access denied), so judge by whether the root is gone.
+    if result.returncode != 0:
+        logging.warning("taskkill exited %d for PID %d", result.returncode, pid)
+    return result.returncode == 0 or not _win_is_running(pid)
 
 
 _codex_launcher_cache: Optional[List[str]] = None
@@ -184,7 +204,8 @@ def _codex_launcher() -> List[str]:
     batch file routes every argument through cmd.exe, which truncates the
     prompt at the first newline and interprets ``& | < > ^ %``. So resolve the
     shim to ``node codex.js`` (or a native codex.exe) and never touch cmd.exe.
-    ``CODEX_SWARM_CODEX_BIN`` overrides the lookup with an .exe or .js path.
+    ``CODEX_SWARM_CODEX_BIN`` overrides the lookup with an .exe or .js path;
+    anything else (notably .cmd/.bat) is refused for the same reason.
     """
     global _codex_launcher_cache
     if not _IS_WINDOWS:
@@ -201,7 +222,18 @@ def _codex_launcher() -> List[str]:
 
     override = os.environ.get("CODEX_SWARM_CODEX_BIN")
     if override:
-        launcher = node_for(override) if override.lower().endswith(".js") else [override]
+        # Absolute now: Codex runs with cwd set to the task's directory or
+        # worktree, where a relative path would name a different file.
+        override = os.path.abspath(override)
+        if override.lower().endswith(".js"):
+            launcher = node_for(override)
+        elif override.lower().endswith(".exe"):
+            launcher = [override]
+        else:
+            raise RuntimeError(
+                f"CODEX_SWARM_CODEX_BIN={override} must be a .exe or .js file; "
+                "batch files would route the prompt through cmd.exe"
+            )
     else:
         found = shutil.which("codex")
         if not found:
@@ -210,7 +242,13 @@ def _codex_launcher() -> List[str]:
             launcher = [found]
         else:
             shim_dir = os.path.dirname(found)
-            js = os.path.join(shim_dir, "node_modules", "@openai", "codex", "bin", "codex.js")
+            # Global npm puts the shim beside node_modules; a project-local
+            # install puts it in node_modules\.bin.
+            if os.path.basename(shim_dir).lower() == ".bin":
+                modules_dir = os.path.dirname(shim_dir)
+            else:
+                modules_dir = os.path.join(shim_dir, "node_modules")
+            js = os.path.join(modules_dir, "@openai", "codex", "bin", "codex.js")
             if not os.path.isfile(js):
                 raise RuntimeError(
                     f"{found} is a script shim and {js} does not exist; "
@@ -2343,7 +2381,14 @@ def _cancel_task(task_id: str) -> Dict[str, Any]:
     if pid and _IS_WINDOWS and _is_alive(pid, expected_start_time=pid_start_time):
         # No SIGTERM/SIGKILL on Windows, and os.kill would only reach the node
         # launcher; take down the whole tree instead.
-        _win_kill_tree(pid)
+        if not _win_kill_tree(pid):
+            # Leave it running/tracked so a retry is possible; marking it
+            # cancelled would hide a process that is still editing files.
+            return {
+                "status": "error",
+                "task_id": task_id,
+                "error": f"Failed to kill process tree of PID {pid}; task is still running",
+            }
         logging.info("Killed process tree of PID %d (task %s)", pid, task_id)
     elif pid and _is_alive(pid, expected_start_time=pid_start_time):
         # Terminate the process

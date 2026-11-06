@@ -224,7 +224,7 @@ The server exposes read-only resources for discoverability:
 | `CODEX_SWARM_WORKTREE_DIR` | `/tmp/codex-swarm-worktrees` | Worktree storage directory |
 | `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds before completed task artifacts (and worktrees) are cleaned up |
 | `CODEX_SWARM_MIN_WAIT` | `150` | Floor in seconds for `codex_wait`. Keeps the call above the client's 2-minute auto-backgrounding threshold so completion re-invokes the session. Already-finished tasks ignore it |
-| `CODEX_SWARM_CODEX_BIN` | _(auto)_ | Windows only: path to `codex.exe` or to the npm package's `codex.js`, overriding the PATH lookup |
+| `CODEX_SWARM_CODEX_BIN` | _(auto)_ | Windows only: path to `codex.exe` or to the npm package's `codex.js`, overriding the PATH lookup. Batch files (`.cmd`/`.bat`) are refused |
 
 On Windows the `/tmp/...` defaults become the per-user temp directory (`%TEMP%`).
 
