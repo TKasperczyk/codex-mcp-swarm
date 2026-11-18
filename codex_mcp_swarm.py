@@ -44,7 +44,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.12.0"
+__version__ = "1.12.1"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -2041,7 +2041,7 @@ _CODEX_PROPERTIES = {
     },
     "model": {
         "type": "string",
-        "description": "Optional override for the model name (e.g. 'gpt-6-astra').",
+        "description": "Optional override for the model name (e.g. 'gpt-6.2-astra').",
     },
     "profile": {
         "type": "string",
