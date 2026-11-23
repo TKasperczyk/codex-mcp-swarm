@@ -1161,6 +1161,7 @@ def test_stdio_server_end_to_end_protocol_lines():
         text=True,
         env=env,
         timeout=15,
+        check=False,
     )
     assert proc.returncode == 0, f"server exited {proc.returncode}: {proc.stderr}"
     frames = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
@@ -1203,6 +1204,7 @@ def test_malformed_jsonrpc_unhashable_id_method_and_cancel_request_id():
         text=True,
         env=env,
         timeout=15,
+        check=False,
     )
     assert proc.returncode == 0, f"server crashed on malformed input: rc={proc.returncode} stderr={proc.stderr}"
     frames = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
@@ -1847,6 +1849,357 @@ print(json.dumps({{"type": "turn.completed"}}), flush=True)
         else:
             m._win_kill_tree = real_win_kill
         m._last_cleanup = real_last_cleanup
+
+
+def test_jsonl_unicode_line_separators_preserved():
+    """RFC 8259 allows raw U+2028/U+2029/U+0085 inside JSON strings (Rust
+    serde_json emits them unescaped). Neither single-pass nor incremental JSONL
+    parsing may split events on those characters.
+    """
+    msg = "alpha\u2028beta\u2029gamma\x85delta"
+    small_jsonl = (
+        json.dumps({"type": "thread.started", "thread_id": "t-ls-small"}, ensure_ascii=False)
+        + "\n"
+        + json.dumps(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": msg}},
+            ensure_ascii=False,
+        )
+        + "\n"
+        + json.dumps({"type": "turn.completed"}, ensure_ascii=False)
+        + "\n"
+    )
+    a_small, s_small = m._parse_jsonl_full(small_jsonl)
+    assert a_small["thread_id"] == "t-ls-small"
+    assert a_small["last_assistant_text"] == msg
+    assert a_small["terminal_status"] == "completed"
+    assert s_small["last_assistant_text"] == msg
+
+    # Large file (>8 KiB) + incremental append containing U+2028/U+2029
+    big_path = m.TASK_DIR / "unicode_ls_big.stdout"
+    lines = [json.dumps({"type": "thread.started", "thread_id": "t-ls-big"}, ensure_ascii=False)]
+    for i in range(120):
+        lines.append(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"type": "command_execution", "command": f"echo {i} " + ("x" * 80)},
+                },
+                ensure_ascii=False,
+            )
+        )
+    big_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert big_path.stat().st_size > m._JSONL_CACHE_MIN_BYTES
+    a1, s1 = m._parse_jsonl_file(big_path)
+    assert a1["thread_id"] == "t-ls-big" and s1["tools_called"] == 120
+
+    with open(big_path, "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {"type": "item.completed", "item": {"type": "agent_message", "text": msg}},
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps({"type": "turn.completed"}, ensure_ascii=False)
+            + "\n"
+        )
+    a2, s2 = m._parse_jsonl_file(big_path)
+    assert a2["last_assistant_text"] == msg
+    assert a2["terminal_status"] == "completed"
+    assert s2["phase"] == "completed"
+
+
+def test_jsonl_rollout_non_string_fields_no_crash_and_schema_valid():
+    """Malformed/non-string rollout response_item fields must never raise
+    TypeError or violate codex_status outputSchema string types.
+    """
+    tools_by_name = {t["name"]: t for t in m.TOOLS}
+    cases = [
+        json.dumps({"type": "thread.started", "thread_id": 12345}),
+        json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": {"cmd": ["ls", "-la"]}}}),
+        json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": {"cmd": 42}}}),
+        json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": None, "arguments": "{}"}}),
+        json.dumps({"type": "response_item", "payload": {"type": "reasoning", "content": 999}}),
+        json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": 123}}),
+        json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": None}, {"type": "output_text", "text": "safe"}]}}),
+    ]
+    for line in cases:
+        analysis, status = m._parse_jsonl_full(line + "\n")
+        assert analysis["thread_id"] is None or isinstance(analysis["thread_id"], str)
+        if status["last_tool"] is not None:
+            assert isinstance(status["last_tool"], str)
+        if status["last_tool_args"] is not None:
+            assert isinstance(status["last_tool_args"], str)
+        m._format_task_activity_brief(status)
+
+    tid = "badd0001"
+    (m.TASK_DIR / f"{tid}.meta").write_text(
+        json.dumps({"task_id": tid, "status": "completed", "started_at": time.time() - 5, "completed_at": time.time(), "exit_code": 0}),
+        encoding="utf-8",
+    )
+    (m.TASK_DIR / f"{tid}.stdout").write_text("\n".join(cases) + "\n", encoding="utf-8")
+    (m.TASK_DIR / f"{tid}.stderr").write_text("", encoding="utf-8")
+
+    res = send_req("tools/call", {"name": "codex_status", "arguments": {"task_ids": [tid]}}).responses()[0]["result"]
+    assert res["isError"] is False
+    validate_against_schema(res["structuredContent"], tools_by_name["codex_status"]["outputSchema"])
+
+
+def test_sync_notifications_cancelled_status_pre_spawn_and_nonblocking():
+    """Verify sync cancellation fixes:
+    1. Cancelling an in-flight sync call via notifications/cancelled reports
+       status='cancelled' (not 'failed' exit -15).
+    2. notifications/cancelled does not block _handle() on a child that ignores
+       SIGTERM (termination runs off the main stdin thread).
+    3. Pre-cancelled requests never spawn Codex or create a worktree.
+    """
+    # --- 1. Pre-cancelled request must not spawn Codex ---
+    ran_marker = Path(TEST_ROOT) / "pre_cancel_ran"
+    marker_script = make_fake_codex_script(
+        "fake_pre_cancel.py",
+        f"from pathlib import Path\nPath({str(ran_marker)!r}).write_text('RAN')\n",
+    )
+    pre_rid = _next_id()
+    m._mark_cancelled(pre_rid)
+    try:
+        with with_fake_codex(marker_script):
+            out = m._run_sync_detailed({"prompt": "never run"}, request_id=pre_rid)
+            out_reply = m._run_reply_sync_detailed("t-pre", "never run", request_id=pre_rid)
+        assert out["status"] == "cancelled" and out["failed"] is True
+        assert out_reply["status"] == "cancelled" and out_reply["failed"] is True
+        assert not ran_marker.exists(), "pre-cancelled request still spawned codex"
+    finally:
+        with m._cancelled_lock:
+            m._cancelled_requests.discard(pre_rid)
+
+    # --- 2. In-flight sync cancel reports status='cancelled' and doesn't block _handle ---
+    if sys.platform == "win32":
+        return
+
+    stubborn_script = make_fake_codex_script(
+        "fake_sync_cancel_stubborn.py",
+        "import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n_ = sys.stdin.read()\ntime.sleep(60)\n",
+    )
+    rid = _next_id()
+    box = {}
+
+    def run_sync():
+        with with_fake_codex(stubborn_script):
+            box["outcome"] = m._run_sync_detailed({"prompt": "cancel me"}, request_id=rid)
+
+    t = threading.Thread(target=run_sync)
+    t.start()
+    try:
+        for _ in range(100):
+            with m._sync_procs_lock:
+                if rid in m._SYNC_PROCS:
+                    break
+            time.sleep(0.02)
+        with m._sync_procs_lock:
+            assert rid in m._SYNC_PROCS, "sync proc did not register"
+
+        # notifications/cancelled must return immediately (not block 5s waiting for SIGKILL!)
+        t0 = time.time()
+        m._handle({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": rid},
+        })
+        elapsed_handle = time.time() - t0
+        assert elapsed_handle < 1.0, f"notifications/cancelled blocked main thread for {elapsed_handle:.2f}s"
+
+        t.join(timeout=10)
+        assert not t.is_alive(), "cancelled sync thread hung"
+        assert box["outcome"]["status"] == "cancelled", f"expected status='cancelled', got {box['outcome']}"
+        assert box["outcome"]["failed"] is True
+    finally:
+        with m._cancelled_lock:
+            m._cancelled_requests.discard(rid)
+
+
+def test_jsonl_incremental_exact_size_shrink_and_zero_inode():
+    """Verify exact-size shrink race (shrunk_size == entry['size']) falls back
+    to full read instead of splicing stale state, and st_ino == 0 bypasses cache.
+    """
+    import builtins
+
+    p = m.TASK_DIR / "race_shrink_exact.stdout"
+    base_lines = [json.dumps({"type": "thread.started", "thread_id": "t-exact-old"})]
+    for i in range(120):
+        base_lines.append(
+            json.dumps({
+                "type": "item.started",
+                "item": {"type": "command_execution", "command": f"echo old-{i} " + ("x" * 80)},
+            })
+        )
+    partial = '{"type": "item.started", "item": {"type": "command_execution", "command": "' + ("p" * 200)
+    p.write_text("\n".join(base_lines) + "\n" + partial, encoding="utf-8")
+
+    a1, s1 = m._parse_jsonl_file(p)
+    assert a1["thread_id"] == "t-exact-old" and s1["tools_called"] == 120
+    orig_size = m._JSONL_CACHE[str(p)]["size"]
+
+    # Grow past orig_size so stat() enters the incremental branch
+    with open(p, "a", encoding="utf-8") as f:
+        f.write('zzz"}}\n' + (" " * 100) + "\n")
+
+    # Replace in-place with fresh content of exact byte size == orig_size
+    fresh = json.dumps({"type": "thread.started", "thread_id": "t-exact-new"}) + "\n"
+    fresh += "\n" * (orig_size - len(fresh.encode("utf-8")))
+    assert len(fresh.encode("utf-8")) == orig_size
+
+    real_open = builtins.open
+    done = [False]
+
+    def shrink_exact_on_open(file, mode="r", *args, **kwargs):
+        if Path(file) == p and mode == "rb" and not done[0]:
+            done[0] = True
+            with real_open(p, "w", encoding="utf-8") as wf:
+                wf.write(fresh)
+        return real_open(file, mode, *args, **kwargs)
+
+    m.open = shrink_exact_on_open
+    try:
+        a2, s2 = m._parse_jsonl_file(p)
+    finally:
+        delattr(m, "open")
+
+    assert done[0] is True
+    assert a2["thread_id"] == "t-exact-new", f"stale state spliced on exact-size shrink: {a2}"
+    assert s2["tools_called"] == 0, f"stale tool count leaked on exact-size shrink: {s2}"
+
+    # Verify st_ino == 0 (e.g., FAT32/SMB/FUSE) bypasses inode-based caching cleanly
+    p_zero = m.TASK_DIR / "zero_ino.stdout"
+    p_zero.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+    assert p_zero.stat().st_size > m._JSONL_CACHE_MIN_BYTES
+    real_stat = Path.stat
+
+    class _ZeroInoStat:
+        def __init__(self, st):
+            self._st = st
+            self.st_ino = 0
+
+        def __getattr__(self, name):
+            return getattr(self._st, name)
+
+    def fake_zero_ino_stat(self, *args, **kwargs):
+        st = real_stat(self, *args, **kwargs)
+        return _ZeroInoStat(st) if self == p_zero else st
+
+    Path.stat = fake_zero_ino_stat
+    try:
+        az, sz = m._parse_jsonl_file(p_zero)
+    finally:
+        Path.stat = real_stat
+    assert az["thread_id"] == "t-exact-old" and sz["tools_called"] == 120
+    assert str(p_zero) not in m._JSONL_CACHE, "st_ino == 0 file must not be cached by inode"
+
+
+def test_start_async_meta_write_failure_cleans_up_child_files_and_tracking():
+    """If _write_meta_atomic fails after Popen in _start_async_internal, the
+    spawned child must be killed, _ASYNC_PIDS/_ASYNC_PROCS cleaned, and task
+    files (.stdout/.stderr/.stdin) unlinked (including Windows .stdin path).
+    """
+    sleep_script = make_fake_codex_script(
+        "fake_meta_fail_sleep.py",
+        "import sys, time\n_ = sys.stdin.read()\ntime.sleep(60)\n",
+    )
+    real_write_meta = m._write_meta_atomic
+    real_is_windows = m._IS_WINDOWS
+    real_popen_kw = m._popen_kw
+    real_get_start = m._get_pid_start_time
+    real_win_kill = getattr(m, "_win_kill_tree", None)
+
+    for win_mode in (False, True):
+        before_files = set(m.TASK_DIR.iterdir())
+        before_pids = set(m._ASYNC_PIDS)
+        spawned_pids = []
+
+        def failing_write_meta(meta_file, meta, _box=spawned_pids):
+            _box.append(meta["pid"])
+            raise OSError("simulated disk full")
+
+        try:
+            m._write_meta_atomic = failing_write_meta
+            if win_mode:
+                m._IS_WINDOWS = True
+                m._popen_kw = lambda **_kw: {"start_new_session": True} if sys.platform != "win32" else {}
+                m._get_pid_start_time = lambda pid: None
+                m._win_kill_tree = lambda pid: (os.kill(pid, signal.SIGKILL) or True) if pid else True
+            with with_fake_codex(sleep_script):
+                try:
+                    m._start_async({"prompt": "will fail meta write"})
+                    raise AssertionError("expected OSError from _write_meta_atomic")
+                except OSError:
+                    pass
+        finally:
+            m._write_meta_atomic = real_write_meta
+            m._IS_WINDOWS = real_is_windows
+            m._popen_kw = real_popen_kw
+            m._get_pid_start_time = real_get_start
+            if real_win_kill is None:
+                if hasattr(m, "_win_kill_tree"):
+                    delattr(m, "_win_kill_tree")
+            else:
+                m._win_kill_tree = real_win_kill
+
+        assert len(spawned_pids) == 1
+        leaked_pid = spawned_pids[0]
+        assert not m._is_alive(leaked_pid), f"child PID {leaked_pid} leaked (win_mode={win_mode})"
+        assert set(m._ASYNC_PIDS) == before_pids, f"_ASYNC_PIDS leaked {leaked_pid}"
+        assert leaked_pid not in m._ASYNC_PROCS, f"_ASYNC_PROCS leaked {leaked_pid}"
+        assert set(m.TASK_DIR.iterdir()) == before_files, (
+            f"task files leaked after meta write failure (win_mode={win_mode}): "
+            f"{set(m.TASK_DIR.iterdir()) - before_files}"
+        )
+
+
+def test_sigchld_handler_does_not_resurrect_popped_pid_and_vanished_meta_not_found():
+    """Verify:
+    1. _sigchld_handler never resurrects a PID concurrently popped from _ASYNC_PIDS.
+    2. A .meta file vanishing between exists() and read_text() yields status='not_found'
+       (-32602 on tasks/get), not 'error' (-32603).
+    """
+    # 1. Simulate worker popping PID right before waitpid raises ChildProcessError
+    fake_pid = 99999999
+    m._ASYNC_PIDS[fake_pid] = m._NOT_REAPED
+    real_waitpid = m.os.waitpid
+
+    def racing_waitpid(pid, flags):
+        if pid == fake_pid:
+            m._ASYNC_PIDS.pop(fake_pid, None)
+            raise ChildProcessError("already reaped by worker")
+        return real_waitpid(pid, flags)
+
+    m.os.waitpid = racing_waitpid
+    try:
+        m._sigchld_handler(None, None)
+    finally:
+        m.os.waitpid = real_waitpid
+    assert fake_pid not in m._ASYNC_PIDS, "_sigchld_handler resurrected a popped PID"
+
+    # 2. Vanished .meta file returns not_found (-32602) instead of error (-32603)
+    tid = "dead9999"
+    meta_file = m.TASK_DIR / f"{tid}.meta"
+    meta_file.write_text(json.dumps({"task_id": tid, "status": "completed"}), encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def vanish_read_text(self, *args, **kwargs):
+        if self == meta_file:
+            meta_file.unlink(missing_ok=True)
+            raise FileNotFoundError(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    Path.read_text = vanish_read_text
+    try:
+        st = m._resolve_task_state(tid)
+        assert st["status"] == "not_found", f"expected not_found on vanished meta, got {st}"
+        meta_file.write_text(json.dumps({"task_id": tid, "status": "completed"}), encoding="utf-8")
+        err = send_req("tasks/get", {"taskId": tid}).responses()[0]["error"]
+        assert err["code"] == -32602, f"expected -32602 on vanished meta, got {err}"
+    finally:
+        Path.read_text = real_read_text
+        meta_file.unlink(missing_ok=True)
 
 
 def _run_all():

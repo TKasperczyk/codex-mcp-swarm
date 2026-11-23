@@ -38,29 +38,29 @@ License: MIT
 Repository: https://github.com/TKasperczyk/codex-mcp-swarm
 """
 
-import sys
-import json
-import subprocess
-import os
-import time
-import math
-import logging
-import signal
-import secrets
-import traceback
 import argparse
 import contextlib
+import json
+import logging
+import math
+import os
 import re
+import secrets
 import shlex
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
+import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.13.0"
+__version__ = "1.13.1"
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -199,6 +199,7 @@ def _win_kill_tree(pid: int) -> bool:
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
             timeout=30,
+            check=False,
         )
     except Exception as exc:
         logging.warning("taskkill failed for PID %d: %s", pid, exc)
@@ -464,10 +465,14 @@ def _sigchld_handler(signum, frame):
                     exit_code = -os.WTERMSIG(status)  # negative = killed by signal
                 else:
                     exit_code = 127  # unknown abnormal termination
-                _ASYNC_PIDS[pid] = exit_code
+                if _ASYNC_PIDS.get(pid) is _NOT_REAPED:
+                    _ASYNC_PIDS[pid] = exit_code
         except ChildProcessError:
-            # Already reaped by subprocess internals -- exit code lost
-            _ASYNC_PIDS[pid] = None
+            # Already reaped by subprocess internals -- exit code lost.
+            # Guard with _NOT_REAPED so we never resurrect a key just popped
+            # by _finalize_dead_task_locked() or _cancel_task().
+            if _ASYNC_PIDS.get(pid) is _NOT_REAPED:
+                _ASYNC_PIDS[pid] = None
         except OSError:
             pass
 
@@ -877,11 +882,15 @@ def _consume_jsonl_lines(state: Dict[str, Any], lines: List[str]) -> None:
         etype = event.get("type", "")
 
         if etype == "thread.started":
-            state["thread_id"] = event.get("thread_id")
+            tid = event.get("thread_id")
+            if isinstance(tid, str) and tid:
+                state["thread_id"] = tid
         elif etype == "session_meta":
             payload = event.get("payload", {})
             if isinstance(payload, dict) and not state["thread_id"]:
-                state["thread_id"] = payload.get("id")
+                tid = payload.get("id")
+                if isinstance(tid, str) and tid:
+                    state["thread_id"] = tid
 
         if etype == "turn.started":
             state["saw_turn_started"] = True
@@ -957,41 +966,50 @@ def _consume_jsonl_lines(state: Dict[str, Any], lines: List[str]) -> None:
             ptype = payload.get("type", "")
             if ptype == "function_call":
                 state["tools_called"] += 1
-                state["last_tool"] = payload.get("name", "?")
+                raw_name = payload.get("name")
+                state["last_tool"] = (str(raw_name) if raw_name is not None else "") or "?"
                 raw_args = payload.get("arguments", "{}")
                 try:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     if isinstance(args, dict):
-                        state["last_tool_args"] = (
+                        chosen = (
                             args.get("cmd")
                             or args.get("command")
                             or args.get("path")
                             or args.get("pattern")
-                            or str(args)[:150]
                         )
+                        if chosen is not None:
+                            state["last_tool_args"] = (
+                                chosen[:150] if isinstance(chosen, str) else str(chosen)[:150]
+                            )
+                        else:
+                            state["last_tool_args"] = str(args)[:150]
                     else:
                         state["last_tool_args"] = str(args)[:150]
                 except (json.JSONDecodeError, TypeError):
                     state["last_tool_args"] = str(raw_args)[:150]
             elif ptype == "reasoning":
-                content = payload.get("content") or []
-                for c in content:
-                    if isinstance(c, dict):
-                        text_val = c.get("text", "")
-                        if isinstance(text_val, str) and text_val:
-                            state["last_reasoning"] = text_val[-200:]
+                content = payload.get("content")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict):
+                            text_val = c.get("text", "")
+                            if isinstance(text_val, str) and text_val:
+                                state["last_reasoning"] = text_val[-200:]
             elif payload.get("role") == "assistant" and ptype == "message":
-                content = payload.get("content") or []
-                texts = [
-                    c.get("text", "")
-                    for c in content
-                    if isinstance(c, dict)
-                    and c.get("type") in ("output_text", "text", "input_text")
-                ]
-                if texts:
-                    joined = "\n".join(texts)
-                    state["last_assistant_text"] = joined
-                    state["last_assistant_preview"] = texts[-1][-300:]
+                content = payload.get("content")
+                if isinstance(content, list):
+                    texts = [
+                        c["text"]
+                        for c in content
+                        if isinstance(c, dict)
+                        and c.get("type") in ("output_text", "text", "input_text")
+                        and isinstance(c.get("text"), str)
+                    ]
+                    if texts:
+                        joined = "\n".join(texts)
+                        state["last_assistant_text"] = joined
+                        state["last_assistant_preview"] = texts[-1][-300:]
         elif etype == "event_msg":
             # Persisted rollouts use event_msg rather than public exec events.
             payload = event.get("payload", {})
@@ -1070,7 +1088,10 @@ def _finalize_jsonl_views(state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[s
 def _parse_jsonl_full(jsonl_text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Single-pass parse of JSONL text returning ``(analysis, status)``."""
     state = _new_jsonl_state()
-    _consume_jsonl_lines(state, jsonl_text.splitlines())
+    # Use split("\n") rather than splitlines() so legal RFC 8259 unescaped
+    # Unicode line separators (\u2028, \u2029, \x85) inside JSON strings never
+    # split a valid JSONL event in half.
+    _consume_jsonl_lines(state, jsonl_text.split("\n"))
     return _finalize_jsonl_views(state)
 
 
@@ -1104,9 +1125,10 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
         _invalidate_jsonl_cache(stdout_path)
         return _finalize_jsonl_views(_new_jsonl_state())
 
-    if st.st_size <= _JSONL_CACHE_MIN_BYTES:
+    if st.st_size <= _JSONL_CACHE_MIN_BYTES or st.st_ino == 0:
         # Evict any prior large-file entry for the same path so truncating
-        # and later regrowing the same inode can never splice stale state.
+        # and later regrowing the same inode can never splice stale state, and
+        # skip inode-based caching on filesystems that report st_ino == 0.
         _invalidate_jsonl_cache(stdout_path)
         try:
             text = stdout_path.read_text(encoding="utf-8", errors="replace")
@@ -1119,6 +1141,7 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
         entry = _JSONL_CACHE.get(key)
         if (
             entry is not None
+            and entry["dev"] == st.st_dev
             and entry["ino"] == st.st_ino
             and entry["size"] == st.st_size
             and entry["mtime_ns"] == st.st_mtime_ns
@@ -1127,6 +1150,7 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
 
         if (
             entry is not None
+            and entry["dev"] == st.st_dev
             and entry["ino"] == st.st_ino
             and st.st_size > entry["size"]
             and entry["offset"] <= st.st_size
@@ -1135,21 +1159,22 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
                 with open(stdout_path, "rb") as f:
                     fst_before = os.fstat(f.fileno())
                     if (
-                        fst_before.st_ino == entry["ino"]
-                        and fst_before.st_size >= entry["size"]
+                        fst_before.st_dev == entry["dev"]
+                        and fst_before.st_ino == entry["ino"]
+                        and fst_before.st_size > entry["size"]
                     ):
                         f.seek(entry["offset"])
                         chunk = f.read()
                         fst_after = os.fstat(f.fileno())
                         consumed_size = entry["offset"] + len(chunk)
-                        if consumed_size >= entry["size"]:
+                        if consumed_size > entry["size"]:
                             last_nl = chunk.rfind(b"\n")
                             if last_nl >= 0:
                                 complete = chunk[: last_nl + 1]
                                 tail = chunk[last_nl + 1 :]
                                 _consume_jsonl_lines(
                                     entry["state"],
-                                    complete.decode("utf-8", errors="replace").splitlines(),
+                                    complete.decode("utf-8", errors="replace").split("\n"),
                                 )
                                 entry["offset"] += len(complete)
                             else:
@@ -1188,7 +1213,7 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
             complete = raw[: last_nl + 1]
             tail = raw[last_nl + 1 :]
             _consume_jsonl_lines(
-                state, complete.decode("utf-8", errors="replace").splitlines()
+                state, complete.decode("utf-8", errors="replace").split("\n")
             )
             offset = len(complete)
         else:
@@ -1201,11 +1226,12 @@ def _parse_jsonl_file(stdout_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]
         else:
             view_state = state
 
-        if len(raw) > _JSONL_CACHE_MIN_BYTES:
+        if len(raw) > _JSONL_CACHE_MIN_BYTES and fst.st_ino != 0:
             if len(_JSONL_CACHE) >= _JSONL_CACHE_MAX_ENTRIES and key not in _JSONL_CACHE:
                 oldest_key = next(iter(_JSONL_CACHE))
                 _JSONL_CACHE.pop(oldest_key, None)
             _JSONL_CACHE[key] = {
+                "dev": fst.st_dev,
                 "ino": fst.st_ino,
                 "size": len(raw),
                 "mtime_ns": fst.st_mtime_ns,
@@ -1224,7 +1250,7 @@ def _extract_thread_id_fast(
     """Extract ``thread_id`` from metadata or the opening lines of ``.stdout``
     without reading or parsing the entire output file.
     """
-    if meta and meta.get("thread_id"):
+    if meta and isinstance(meta.get("thread_id"), str) and meta["thread_id"]:
         return meta["thread_id"]
     if not stdout_path.exists():
         return None
@@ -1241,12 +1267,16 @@ def _extract_thread_id_fast(
                         event = None
                     if isinstance(event, dict):
                         etype = event.get("type", "")
-                        if etype == "thread.started" and event.get("thread_id"):
-                            return event["thread_id"]
+                        if etype == "thread.started":
+                            tid = event.get("thread_id")
+                            if isinstance(tid, str) and tid:
+                                return tid
                         if etype == "session_meta":
                             payload = event.get("payload", {})
-                            if isinstance(payload, dict) and payload.get("id"):
-                                return payload["id"]
+                            if isinstance(payload, dict):
+                                tid = payload.get("id")
+                                if isinstance(tid, str) and tid:
+                                    return tid
                 if bytes_read >= 65536:
                     break
     except OSError:
@@ -1792,9 +1822,12 @@ _CLIENT_AUTO_BACKGROUND_S = 120
 # that are ALREADY finished still return immediately -- _wait_tasks resolves
 # every task before it ever consults the deadline -- so this only extends waits
 # that would have come back empty-handed anyway.
-_WAIT_MIN_TIMEOUT = int(
-    os.environ.get("CODEX_SWARM_MIN_WAIT", _CLIENT_AUTO_BACKGROUND_S + 30)
-)
+try:
+    _WAIT_MIN_TIMEOUT = int(
+        os.environ.get("CODEX_SWARM_MIN_WAIT", str(_CLIENT_AUTO_BACKGROUND_S + 30))
+    )
+except (ValueError, TypeError):
+    _WAIT_MIN_TIMEOUT = _CLIENT_AUTO_BACKGROUND_S + 30
 
 # A wrapper-level "failure" is not proof the Codex run died or that its edits
 # never landed. Both of these are attached to output that callers have
@@ -1964,6 +1997,7 @@ def _wait_proc_detailed(
     progress_label: str = "Codex",
     command: Any = None,
     model: Optional[str] = None,
+    own_group: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Wait for a Popen process with cancellation, timeout and progress support.
@@ -1976,7 +2010,7 @@ def _wait_proc_detailed(
         if deadline is not None:
             remaining = deadline - time.time()
             if remaining <= 0:
-                _stop_proc(proc)
+                _stop_proc(proc, own_group=own_group)
                 return {
                     "text": timeout_msg,
                     "thread_id": None,
@@ -1990,6 +2024,17 @@ def _wait_proc_detailed(
         wait_time = min(_POLL_INTERVAL, remaining) if remaining is not None else _POLL_INTERVAL
         try:
             stdout, stderr = proc.communicate(timeout=wait_time)
+            if request_id is not None and _is_cancelled(request_id):
+                return {
+                    "text": "Cancelled by client",
+                    "thread_id": None,
+                    "failed": True,
+                    "status": "cancelled",
+                    "exit_code": proc.returncode,
+                    "model": model or _model_from_command(command),
+                    "failure": None,
+                    "partial_output": None,
+                }
             analysis = _analyze_jsonl(stdout)
             status, _ = _decide_run_status(proc.returncode, analysis, stderr)
             if status == "failed":
@@ -2024,7 +2069,7 @@ def _wait_proc_detailed(
             }
         except subprocess.TimeoutExpired:
             if request_id is not None and _is_cancelled(request_id):
-                _stop_proc(proc)
+                _stop_proc(proc, own_group=own_group)
                 return {
                     "text": "Cancelled by client",
                     "thread_id": None,
@@ -2085,8 +2130,22 @@ def _run_sync_detailed(
     meta_status = "failed"
     resolved_model = _resolve_model(cmd_params)
     proc_started = False
+    proc = None
 
     worktree_enabled = bool(cmd_params.pop("worktree", False))
+
+    if request_id is not None and _is_cancelled(request_id):
+        return {
+            "text": "Cancelled by client",
+            "thread_id": None,
+            "worktree_info": None,
+            "failed": True,
+            "status": "cancelled",
+            "exit_code": None,
+            "model": resolved_model,
+            "failure": None,
+            "partial_output": None,
+        }
 
     try:
         if worktree_enabled:
@@ -2098,6 +2157,24 @@ def _run_sync_detailed(
                 "worktree_root": wt_root,
                 "worktree_path": wt_cwd,
                 "worktree_branch": worktree_branch,
+            }
+
+        if request_id is not None and _is_cancelled(request_id):
+            if worktree_info:
+                _remove_worktree(
+                    worktree_info["worktree_root"], worktree_info["worktree_branch"]
+                )
+                worktree_info = None
+            return {
+                "text": "Cancelled by client",
+                "thread_id": None,
+                "worktree_info": None,
+                "failed": True,
+                "status": "cancelled",
+                "exit_code": None,
+                "model": resolved_model,
+                "failure": None,
+                "partial_output": None,
             }
 
         cmd, cwd = _build_command(cmd_params)
@@ -2118,21 +2195,37 @@ def _run_sync_detailed(
                 stdin_fh.close()
             proc_started = True
             _register_sync_proc(request_id, proc)
-            outcome = _wait_proc_detailed(
-                proc,
-                request_id=request_id,
-                timeout_msg="Error: Codex execution timed out",
-                progress_token=progress_token,
-                progress_label="Codex",
-                command=cmd,
-                model=resolved_model,
-            )
+            if request_id is not None and _is_cancelled(request_id):
+                _stop_proc(proc, own_group=True)
+                outcome = {
+                    "text": "Cancelled by client",
+                    "thread_id": None,
+                    "failed": True,
+                    "status": "cancelled",
+                    "exit_code": proc.returncode,
+                    "model": resolved_model or _model_from_command(cmd),
+                    "failure": None,
+                    "partial_output": None,
+                }
+            else:
+                outcome = _wait_proc_detailed(
+                    proc,
+                    request_id=request_id,
+                    timeout_msg="Error: Codex execution timed out",
+                    progress_token=progress_token,
+                    progress_label="Codex",
+                    command=cmd,
+                    model=resolved_model,
+                    own_group=True,
+                )
         thread_id = outcome["thread_id"]
         exit_code = outcome["exit_code"]
         meta_status = outcome["status"]
         outcome["worktree_info"] = worktree_info
         return outcome
     except Exception as exc:
+        if proc is not None and callable(getattr(proc, "poll", None)) and proc.poll() is None:
+            _stop_proc(proc, own_group=True)
         if worktree_info and not proc_started:
             _remove_worktree(
                 worktree_info["worktree_root"], worktree_info["worktree_branch"]
@@ -2208,6 +2301,17 @@ def _run_reply_sync_detailed(
     params["threadId"] = thread_id
     params["prompt"] = prompt
     resolved_model = _resolve_model(params)
+    if request_id is not None and _is_cancelled(request_id):
+        return {
+            "text": "Cancelled by client",
+            "thread_id": thread_id,
+            "failed": True,
+            "status": "cancelled",
+            "exit_code": None,
+            "model": resolved_model,
+            "failure": None,
+            "partial_output": None,
+        }
     cmd, cwd = _build_command(params)
     cmd = _with_json_flag(cmd)
     logging.info("Reply exec: %s", shlex.join(cmd))
@@ -2230,19 +2334,35 @@ def _run_reply_sync_detailed(
             if stdin_fh is not subprocess.DEVNULL:
                 stdin_fh.close()
             _register_sync_proc(request_id, proc)
-            outcome = _wait_proc_detailed(
-                proc,
-                request_id=request_id,
-                timeout_msg="Error: Codex reply timed out",
-                progress_token=progress_token,
-                progress_label="Codex reply",
-                command=cmd,
-                model=resolved_model,
-            )
+            if request_id is not None and _is_cancelled(request_id):
+                _stop_proc(proc, own_group=True)
+                outcome = {
+                    "text": "Cancelled by client",
+                    "thread_id": thread_id,
+                    "failed": True,
+                    "status": "cancelled",
+                    "exit_code": proc.returncode,
+                    "model": resolved_model or _model_from_command(cmd),
+                    "failure": None,
+                    "partial_output": None,
+                }
+            else:
+                outcome = _wait_proc_detailed(
+                    proc,
+                    request_id=request_id,
+                    timeout_msg="Error: Codex reply timed out",
+                    progress_token=progress_token,
+                    progress_label="Codex reply",
+                    command=cmd,
+                    model=resolved_model,
+                    own_group=True,
+                )
         if not outcome["thread_id"]:
             outcome["thread_id"] = thread_id
         return outcome
     except Exception as exc:
+        if proc is not None and callable(getattr(proc, "poll", None)) and proc.poll() is None:
+            _stop_proc(proc, own_group=True)
         return {
             "text": f"Error calling Codex reply: {exc}",
             "thread_id": thread_id,
@@ -2275,7 +2395,7 @@ def _run_reply_sync(
 # ===================================================================
 
 try:
-    _TASK_MAX_AGE = int(os.environ.get("CODEX_SWARM_TASK_MAX_AGE", 86400))
+    _TASK_MAX_AGE = int(os.environ.get("CODEX_SWARM_TASK_MAX_AGE", "86400"))
 except (ValueError, TypeError):
     _TASK_MAX_AGE = 86400  # default 24h
 _last_cleanup = 0.0
@@ -2377,6 +2497,7 @@ def _start_async_internal(
     stdout_f: Optional[Path] = None
     stderr_f: Optional[Path] = None
     stdin_f: Optional[Path] = None
+    proc: Optional[subprocess.Popen] = None
     try:
         cmd, cwd = _build_command(cmd_params)
         # Add --json for structured output (enables live status parsing)
@@ -2390,21 +2511,58 @@ def _start_async_internal(
 
         with open(stdout_f, "w", encoding="utf-8") as out, open(
             stderr_f, "w", encoding="utf-8"
-        ) as err:
-            with _prompt_stdin(
-                cmd_params.get("prompt", ""), stdin_path=stdin_f
-            ) as stdin_fh:
-                proc = subprocess.Popen(
-                    _exec_argv(cmd),
-                    stdin=stdin_fh,
-                    stdout=out,
-                    stderr=err,
-                    cwd=cwd,
-                    **_TEXT_KW,
-                    **_popen_kw(detach=True),
-                )
+        ) as err, _prompt_stdin(
+            cmd_params.get("prompt", ""), stdin_path=stdin_f
+        ) as stdin_fh:
+            proc = subprocess.Popen(
+                _exec_argv(cmd),
+                stdin=stdin_fh,
+                stdout=out,
+                stderr=err,
+                cwd=cwd,
+                **_TEXT_KW,
+                **_popen_kw(detach=True),
+            )
+
+        # Track PID for SIGCHLD handler (sentinel replaced on reap)
+        _ASYNC_PIDS[proc.pid] = _NOT_REAPED
+        # Keep Popen alive so Python's finalizer doesn't steal the exit code
+        _ASYNC_PROCS[proc.pid] = proc
+
+        started_at = time.time()
+        meta: Dict[str, Any] = {
+            "task_id": task_id,
+            "pid": proc.pid,
+            "pid_start_time": _get_pid_start_time(proc.pid),
+            "status": "running",
+            "command": shlex.join(cmd),
+            "started_at": started_at,
+            "last_updated_at": started_at,
+        }
+        if not _IS_WINDOWS:
+            meta["own_process_group"] = True
+        if resolved_model:
+            meta["model"] = resolved_model
+        if mcp_task:
+            meta["mcp_task"] = True
+            meta["tool_name"] = tool_name
+        if cmd_params.get("threadId"):
+            meta["thread_id"] = str(cmd_params["threadId"])
+        if worktree_root:
+            meta["worktree_root"] = worktree_root
+        if worktree_path:
+            meta["worktree_path"] = worktree_path
+        if worktree_branch:
+            meta["worktree_branch"] = worktree_branch
+        _write_meta_atomic(TASK_DIR / f"{task_id}.meta", meta)
     except Exception:
-        # Clean up worktree and empty log/stdin files if task launch fails
+        # Clean up any spawned child, tracking entries, log/stdin files, and
+        # worktree if launch or metadata persistence fails.
+        if proc is not None:
+            if callable(getattr(proc, "poll", None)) and proc.poll() is None:
+                _stop_proc(proc, own_group=True)
+            _ASYNC_PIDS.pop(proc.pid, None)
+            _ASYNC_PROCS.pop(proc.pid, None)
         for path in (stdout_f, stderr_f, stdin_f):
             if path is not None:
                 try:
@@ -2414,38 +2572,6 @@ def _start_async_internal(
         if worktree_root and worktree_branch:
             _remove_worktree(worktree_root, worktree_branch)
         raise
-
-    # Track PID for SIGCHLD handler (sentinel replaced on reap)
-    _ASYNC_PIDS[proc.pid] = _NOT_REAPED
-    # Keep Popen alive so Python's finalizer doesn't steal the exit code
-    _ASYNC_PROCS[proc.pid] = proc
-
-    started_at = time.time()
-    meta: Dict[str, Any] = {
-        "task_id": task_id,
-        "pid": proc.pid,
-        "pid_start_time": _get_pid_start_time(proc.pid),
-        "status": "running",
-        "command": shlex.join(cmd),
-        "started_at": started_at,
-        "last_updated_at": started_at,
-    }
-    if not _IS_WINDOWS:
-        meta["own_process_group"] = True
-    if resolved_model:
-        meta["model"] = resolved_model
-    if mcp_task:
-        meta["mcp_task"] = True
-        meta["tool_name"] = tool_name
-    if cmd_params.get("threadId"):
-        meta["thread_id"] = str(cmd_params["threadId"])
-    if worktree_root:
-        meta["worktree_root"] = worktree_root
-    if worktree_path:
-        meta["worktree_path"] = worktree_path
-    if worktree_branch:
-        meta["worktree_branch"] = worktree_branch
-    _write_meta_atomic(TASK_DIR / f"{task_id}.meta", meta)
 
     return {
         "task_id": task_id,
@@ -2612,6 +2738,8 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
 
     try:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "not_found", "task_id": task_id, "error": f"Task {task_id} not found"}
     except Exception as exc:
         return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
 
@@ -2640,6 +2768,8 @@ def _resolve_task_state(task_id: str) -> Dict[str, Any]:
         # Re-read metadata -- another thread may have finalized while we waited
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"status": "not_found", "task_id": task_id, "error": f"Task {task_id} not found"}
         except Exception as exc:
             return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
         if meta.get("status") in ("completed", "failed", "cancelled"):
@@ -3438,6 +3568,8 @@ def _cancel_task(task_id: str) -> Dict[str, Any]:
 
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"status": "not_found", "task_id": task_id, "error": f"Task {task_id} not found"}
         except Exception as exc:
             return {"status": "error", "task_id": task_id, "error": f"Bad metadata: {exc}"}
 
@@ -3807,10 +3939,17 @@ def _handle(request: Dict[str, Any]) -> None:
         if _is_valid_request_id(cancelled_id):
             logging.info("Client cancelled request id=%s", cancelled_id)
             _mark_cancelled(cancelled_id)
-            # Kill the child immediately rather than waiting for the next
-            # 2s poll -- and, more importantly, so it cannot outlive the
-            # request as an untracked orphan.
-            _terminate_sync_proc(cancelled_id)
+            # Terminate any tracked sync child off the main stdin thread so a
+            # stubborn child (5s SIGTERM grace / 30s Windows taskkill timeout)
+            # cannot freeze incoming RPCs while being stopped.
+            with _sync_procs_lock:
+                has_sync = cancelled_id in _SYNC_PROCS
+            if has_sync:
+                threading.Thread(
+                    target=_terminate_sync_proc,
+                    args=(cancelled_id,),
+                    daemon=True,
+                ).start()
         return
 
     # JSON-RPC 2.0 §4.1: unknown notifications MUST NOT receive a reply.
@@ -4201,18 +4340,24 @@ def _handle(request: Dict[str, Any]) -> None:
             # two, ended its turn, and never collected a finished result.
             lines.extend([
                 "",
-                "NOT TRACKED BY YOUR CLIENT. This id is internal to "
-                "codex-swarm. No completion notification will arrive and "
-                "nothing will wake this session when the task finishes.",
+                (
+                    "NOT TRACKED BY YOUR CLIENT. This id is internal to "
+                    "codex-swarm. No completion notification will arrive and "
+                    "nothing will wake this session when the task finishes."
+                ),
                 "",
-                f'You MUST call codex_wait(task_ids=["{task_id}"]) before this '
-                "turn ends, or the result is stranded on disk with nobody to "
-                "collect it. codex_wait is the call your client tracks and the "
-                "only thing that brings the answer back.",
+                (
+                    f'You MUST call codex_wait(task_ids=["{task_id}"]) before this '
+                    "turn ends, or the result is stranded on disk with nobody to "
+                    "collect it. codex_wait is the call your client tracks and the "
+                    "only thing that brings the answer back."
+                ),
                 "",
-                f'codex_status(task_ids=["{task_id}"]) is a progress peek only. '
-                "It does not collect the result and it does not keep the "
-                "session alive.",
+                (
+                    f'codex_status(task_ids=["{task_id}"]) is a progress peek only. '
+                    "It does not collect the result and it does not keep the "
+                    "session alive."
+                ),
             ])
             structured = _clean_none({
                 "status": "started",
@@ -4683,8 +4828,6 @@ def _handle(request: Dict[str, Any]) -> None:
 # ===================================================================
 
 def _parse_args() -> None:
-    global SERVER_CONFIG, SERVER_FLAGS
-
     parser = argparse.ArgumentParser(
         description="codex-mcp-swarm -- Parallel Codex MCP Server",
         usage="codex-mcp-swarm [-c key=value]... [--skip-git-repo-check] [--ephemeral]",
