@@ -9,21 +9,27 @@ The official `codex mcp-server` processes requests sequentially. If your MCP cli
 **Unique features no other Codex MCP wrapper has:**
 
 - **Worktree isolation** -- `worktree: true` creates an isolated git worktree per task so parallel Codex instances never edit past each other
-- **Batch wait** -- launch N tasks, call `codex_wait` once, get all results when they finish
+- **Batch wait & MCP Tasks** -- supports both explicit fan-out (`codex_async` + `codex_wait`) and the official MCP 2026-07-28 Tasks extension (`io.modelcontextprotocol/tasks`)
 - **Live status** -- see what each Codex task is doing right now (last tool call, current reasoning, progress)
 - **Full flag parity** -- same parameters as the official Codex MCP tool (`sandbox`, `approval-policy`, `cwd`, `model`, `config`, etc.)
 - **Drop-in config** -- accepts the same `-c key=value` server args as `codex mcp-server`
+
+## MCP Protocol Support
+
+- **Stateless MCP `2026-07-28`** -- supports `server/discover`, per-request `_meta["io.modelcontextprotocol/protocolVersion"]` and `_meta["io.modelcontextprotocol/clientCapabilities"]`, `resultType` discriminators, and unsupported-version rejection (`-32022`).
+- **Official Tasks extension (`io.modelcontextprotocol/tasks`)** -- when a client advertises `io.modelcontextprotocol/tasks`, `codex` and `codex_reply` immediately return a `CreateTaskResult` (`resultType: "task"`) with a 128-bit `taskId`. Clients poll `tasks/get` (receiving live JSONL activity in `statusMessage`, then `status: "completed"` with the final `CallToolResult` — carrying `isError: true` on tool-level Codex failures per SEP-2663 — or `status: "cancelled"` if aborted) and can cancel via `tasks/cancel` (which returns `-32602` on already-terminal tasks). `codex_async` / `codex_wait` / `codex_status` / `codex_cancel` remain available for non-Tasks clients and multi-task batch fan-out.
+- **Backward-compatible stateful MCP (`2024-11-05`–`2025-11-25`)** -- supports `initialize` negotiation, top-level server `instructions`, `ping`, tool `annotations`, `outputSchema` + `structuredContent` (alongside plain-text `content`), accurate `isError` flags on failures, live enriched `notifications/progress`, and JSON-RPC 2.0 §4.1 silent handling of unknown notifications.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `codex` | Synchronous execution (drop-in replacement for official); terminal failures include the model, structured cause, category, and retryability |
+| `codex` | Synchronous execution (or native MCP Task when client supports `io.modelcontextprotocol/tasks`); terminal failures set `isError: true` and include the model, structured cause, category, and retryability |
 | `codex_async` | Launch a task, get a `task_id` immediately (fan-out). **Not** fire-and-forget: results come back only via `codex_wait`. Pass `threadId` to resume a session |
-| `codex_reply` | Continue a previous session via `codex exec resume`; uses the same structured failure reporting as `codex` |
+| `codex_reply` | Continue a previous session via `codex exec resume` (accepts optional `cwd`, `model`, `sandbox`, `approval-policy`, `config`); uses the same structured failure reporting and MCP Tasks support as `codex` |
 | `codex_status` | Live view: tools called, last command, current thinking, warnings, and terminal failure cause |
 | `codex_wait` | Block until multiple tasks complete and return results or structured failure details |
-| `codex_cancel` | Kill a running async task (preserves worktree for inspection); if it already failed, return the recorded cause |
+| `codex_cancel` | Kill a running async task and its child process tree (preserves worktree for inspection); if it already completed or failed, preserve and report that outcome |
 
 ## Installation
 
@@ -147,7 +153,9 @@ Prevent parallel tasks from editing the same files:
 5. git merge codex-swarm/def456
 ```
 
-Each task gets its own git worktree and branch based on HEAD. After completion, merge the branches back. Worktrees are automatically cleaned up after 24 hours (configurable via `CODEX_SWARM_TASK_MAX_AGE`).
+Each task gets its own git worktree and branch based on `HEAD` (`git worktree add -b codex-swarm/<id> ... HEAD`). After completion, merge the branches back. Worktrees are automatically cleaned up after 24 hours (configurable via `CODEX_SWARM_TASK_MAX_AGE`).
+
+> **Caveat:** Because worktrees branch from `HEAD`, **uncommitted and untracked changes in your working tree are not included** in the worktree. Commit any prerequisite edits first if the Codex task needs to see them.
 
 ### Live monitoring
 
@@ -201,7 +209,7 @@ All parameters from the official Codex MCP tool are supported:
 - `cwd` -- working directory
 - `profile` -- config profile from `config.toml` (ignored on `threadId` resumes -- `codex exec resume` has no `--profile` flag)
 - `config` -- object of key=value overrides
-- `worktree` -- run in an isolated git worktree (prevents parallel tasks from conflicting)
+- `worktree` -- run in an isolated `HEAD`-based git worktree (prevents parallel tasks from conflicting; excludes uncommitted changes)
 - `base-instructions`, `developer-instructions`, `compact-prompt`
 
 ## MCP Resources
@@ -233,14 +241,14 @@ On Windows the `/tmp/...` defaults become the per-user temp directory (`%TEMP%`)
 - Python 3.8+
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated
 - No pip dependencies (stdlib only)
-- Works on Linux and macOS (Linux gets extra PID reuse protection and zombie detection via `/proc`)
+- Works on Linux and macOS (Linux gets extra PID reuse protection and zombie detection via `/proc`; cancellation and timeouts terminate the entire child process group)
 - Works on Windows (native, no WSL): PID reuse protection via process creation time, cancellation kills the whole process tree
 
 ### Windows notes
 
 - An npm-installed Codex is a `codex.cmd` shim. The server resolves it to `node .../@openai/codex/bin/codex.js` and never runs Codex through `cmd.exe`, which would cut multi-line prompts at the first newline and interpret `& | < > ^ %`. If Codex lives elsewhere, set `CODEX_SWARM_CODEX_BIN`.
 - Children are started without a console window and in their own process group. Async tasks are not tied to the server process, but if the MCP client runs the server inside a kill-on-close job object, they end with it.
-- The Windows command line is limited to 32,767 characters, which caps prompt plus instructions per call.
+- Prompts are passed via standard input (`-`), so large or leading-`-` prompts do not hit the 32,767-character Windows command-line limit (only config/instruction flags remain on argv).
 - Codex itself needs a Windows sandbox backend. Without one (`codex doctor` shows `sandbox backend disabled`), `read-only`/`workspace-write` calls with `approval-policy: never` reject every shell command as "blocked by policy". Set it in `~/.codex/config.toml` (`unelevated` needs no admin rights):
   ```toml
   [windows]
