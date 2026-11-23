@@ -1,6 +1,6 @@
 # codex-mcp-swarm
 
-An MCP server that wraps OpenAI's Codex CLI with **true parallel execution** and **live task monitoring**. Zero dependencies -- single Python file, stdlib only.
+An MCP server that wraps OpenAI's Codex CLI with **true parallel execution** and **live task monitoring**. Powered by stdlib-only [`mcp-swarm-core`](https://github.com/TKasperczyk/mcp-swarm-core) (zero third-party runtime dependencies).
 
 ## Why?
 
@@ -153,7 +153,7 @@ Prevent parallel tasks from editing the same files:
 5. git merge codex-swarm/def456
 ```
 
-Each task gets its own git worktree and branch based on `HEAD` (`git worktree add -b codex-swarm/<id> ... HEAD`). After completion, merge the branches back. Worktrees are automatically cleaned up after 24 hours (configurable via `CODEX_SWARM_TASK_MAX_AGE`).
+Each task gets its own git worktree and branch based on `HEAD` (`git worktree add -b codex-swarm/<id> ... HEAD`). After completion, merge the branches back. Expired worktrees (older than `CODEX_SWARM_TASK_MAX_AGE`, default 24 hours) are lazily removed on a subsequent task launch via `git worktree remove --force` and `git branch -D` -- any uncommitted changes or unmerged commits still left in an expired worktree are discarded, so merge or cherry-pick before expiry.
 
 > **Caveat:** Because worktrees branch from `HEAD`, **uncommitted and untracked changes in your working tree are not included** in the worktree. Commit any prerequisite edits first if the Codex task needs to see them.
 
@@ -226,21 +226,21 @@ The server exposes read-only resources for discoverability:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CODEX_SWARM_LOG` | `/tmp/codex_mcp_swarm.log` | Log file path |
+| `CODEX_SWARM_LOG` | `<user-runtime>/codex-swarm/codex_mcp_swarm.log` | Log file path |
 | `CODEX_SWARM_LOG_LEVEL` | `WARNING` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `CODEX_SWARM_TASK_DIR` | `/tmp/codex_swarm_tasks` | Task output storage directory |
-| `CODEX_SWARM_WORKTREE_DIR` | `/tmp/codex-swarm-worktrees` | Worktree storage directory |
-| `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds before completed task artifacts (and worktrees) are cleaned up |
+| `CODEX_SWARM_TASK_DIR` | `<user-runtime>/codex-swarm/tasks` | Task output storage directory (owner-only `0700` when using default) |
+| `CODEX_SWARM_WORKTREE_DIR` | `<user-cache>/codex-swarm/worktrees` | Worktree storage directory (owner-only `0700` when using default) |
+| `CODEX_SWARM_TASK_MAX_AGE` | `86400` (24h) | Seconds after completion / last reply activity before task artifacts (and worktrees) are cleaned up |
 | `CODEX_SWARM_MIN_WAIT` | `150` | Floor in seconds for `codex_wait`. Keeps the call above the client's 2-minute auto-backgrounding threshold so completion re-invokes the session. Already-finished tasks ignore it |
 | `CODEX_SWARM_CODEX_BIN` | _(auto)_ | Windows only: path to `codex.exe` or to the npm package's `codex.js`, overriding the PATH lookup. Batch files (`.cmd`/`.bat`) are refused |
 
-On Windows the `/tmp/...` defaults become the per-user temp directory (`%TEMP%`).
+`<user-runtime>` defaults to `$XDG_RUNTIME_DIR` when available, else `/tmp/codex-swarm-<uid>` on POSIX or `%TEMP%\codex-swarm` on Windows. `<user-cache>` defaults to `${XDG_CACHE_HOME:-~/.cache}` on POSIX (keeping full git checkouts off RAM-capped runtime tmpfs) or `%TEMP%` on Windows. Note: if upgrading from `<= 1.13.1`, any old task/worktree files left under `/tmp/codex_swarm_tasks` or `/tmp/codex-swarm-worktrees` are no longer managed automatically and can be removed manually.
 
 ## Requirements
 
 - Python 3.8+
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated
-- No pip dependencies (stdlib only)
+- Only depends on stdlib-only [`mcp-swarm-core`](https://github.com/TKasperczyk/mcp-swarm-core) (no third-party packages)
 - Works on Linux and macOS (Linux gets extra PID reuse protection and zombie detection via `/proc`; cancellation and timeouts terminate the entire child process group)
 - Works on Windows (native, no WSL): PID reuse protection via process creation time, cancellation kills the whole process tree
 
